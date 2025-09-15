@@ -38,16 +38,7 @@ type ghMilestone struct {
 
 // Jira models (trimmed)
 type jiraIssueCreateRequest struct {
-	Fields jiraIssueFields `json:"fields"`
-}
-
-type jiraIssueFields struct {
-	Project   jiraProjectRef   `json:"project"`
-	Summary   string           `json:"summary"`
-	IssueType jiraIssueTypeRef `json:"issuetype"`
-	Labels    []string         `json:"labels,omitempty"`
-	// Atlassian Document Format for description
-	Description *jiraADFDoc `json:"description,omitempty"`
+	Fields map[string]any `json:"fields"`
 }
 
 type jiraProjectRef struct {
@@ -58,6 +49,33 @@ type jiraProjectRef struct {
 type jiraIssueTypeRef struct {
 	ID   string `json:"id,omitempty"`
 	Name string `json:"name,omitempty"`
+}
+
+// CreateMeta types (trimmed)
+type jiraCreateMetaResponse struct {
+	Projects []struct {
+		ID         string `json:"id"`
+		Key        string `json:"key"`
+		Issuetypes []struct {
+			ID     string                       `json:"id"`
+			Name   string                       `json:"name"`
+			Fields map[string]jiraFieldMetaInfo `json:"fields"`
+		} `json:"issuetypes"`
+	} `json:"projects"`
+}
+
+type jiraFieldMetaInfo struct {
+	Required      bool             `json:"required"`
+	Name          string           `json:"name"`
+	Schema        jiraFieldSchema  `json:"schema"`
+	AllowedValues []map[string]any `json:"allowedValues"`
+	DefaultValue  any              `json:"defaultValue"`
+}
+
+type jiraFieldSchema struct {
+	Type   string `json:"type"`
+	Items  string `json:"items,omitempty"`
+	Custom string `json:"custom,omitempty"`
 }
 
 // ADF (very minimal)
@@ -139,12 +157,20 @@ func main() {
 			log.Printf("warn: jira search failed for #%d: %v", is.Number, err)
 		}
 		if existsKey != "" {
-			log.Printf("skip: Jira issue already exists for #%d: %s", is.Number, existsKey)
+			if cfg.DryRun {
+				log.Printf("[dry-run] would update Jira %s for #%d %q", existsKey, is.Number, is.Title)
+				continue
+			}
+			if err := jiraUpdateFromGitHubIssue(ctx, cfg, existsKey, is); err != nil {
+				log.Printf("error: updating Jira %s for #%d failed: %v", existsKey, is.Number, err)
+			} else {
+				log.Printf("updated Jira issue %s for GitHub #%d", existsKey, is.Number)
+			}
 			continue
 		}
 
 		if cfg.DryRun {
-			log.Printf("[dry-run] would create/search Jira for #%d %q", is.Number, is.Title)
+			log.Printf("[dry-run] would create Jira for #%d %q", is.Number, is.Title)
 			continue
 		}
 		key, err := jiraCreateFromGitHubIssue(ctx, cfg, is)
@@ -361,33 +387,11 @@ func jiraFindExisting(ctx context.Context, cfg config, ghNumber int) (string, er
 
 func jiraCreateFromGitHubIssue(ctx context.Context, cfg config, is ghIssue) (string, error) {
 	client := &http.Client{Timeout: cfg.HTTPTimeout}
-	summary := fmt.Sprintf("cert-manager#%d: %s", is.Number, truncate(is.Title, 200))
-
-	labels := []string{"github", "cert-manager", fmt.Sprintf("milestone:%s", cfg.GitHubMilestone)}
-	// Deduplicate labels (simple)
-	labels = uniqueStrings(labels)
-
-	var desc *jiraADFDoc
-	if !cfg.JiraSkipDescription {
-		desc = buildJiraADFDescription(is)
+	fields, err := buildCreateFieldsMap(ctx, cfg, is)
+	if err != nil {
+		return "", err
 	}
-
-	projRef := jiraProjectRef{Key: cfg.JiraProjectKey}
-	if cfg.JiraProjectID != "" {
-		projRef = jiraProjectRef{ID: cfg.JiraProjectID}
-	}
-	typeRef := jiraIssueTypeRef{Name: cfg.JiraIssueType}
-	if cfg.JiraIssueTypeID != "" {
-		typeRef = jiraIssueTypeRef{ID: cfg.JiraIssueTypeID}
-	}
-
-	payload := jiraIssueCreateRequest{Fields: jiraIssueFields{
-		Project:     projRef,
-		Summary:     summary,
-		IssueType:   typeRef,
-		Labels:      labels,
-		Description: desc,
-	}}
+	payload := jiraIssueCreateRequest{Fields: fields}
 
 	b, _ := json.Marshal(payload)
 	reqURL := fmt.Sprintf("%s/rest/api/3/issue", strings.TrimRight(cfg.JiraBaseURL, "/"))
@@ -402,9 +406,9 @@ func jiraCreateFromGitHubIssue(ctx context.Context, cfg config, is ghIssue) (str
 	defer resp.Body.Close()
 	if resp.StatusCode != 201 {
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, 8192))
-		if resp.StatusCode == 400 && !cfg.JiraSkipDescription && desc != nil {
+		if resp.StatusCode == 400 && !cfg.JiraSkipDescription && payload.Fields["description"] != nil {
 			// Retry once without description in case ADF or required fields cause INVALID_INPUT
-			payload.Fields.Description = nil
+			payload.Fields["description"] = nil
 			b2, _ := json.Marshal(payload)
 			req2, _ := http.NewRequestWithContext(ctx, http.MethodPost, reqURL, strings.NewReader(string(b2)))
 			req2.Header.Set("Authorization", jiraAuthHeader(cfg.JiraEmail, cfg.JiraAPIToken))
@@ -434,6 +438,91 @@ func jiraCreateFromGitHubIssue(ctx context.Context, cfg config, is ghIssue) (str
 	return out.Key, nil
 }
 
+// jiraUpdateFromGitHubIssue updates summary, labels, and description of an existing Jira issue
+func jiraUpdateFromGitHubIssue(ctx context.Context, cfg config, issueKey string, is ghIssue) error {
+	client := &http.Client{Timeout: cfg.HTTPTimeout}
+	summary := fmt.Sprintf("cert-manager#%d: %s", is.Number, truncate(is.Title, 200))
+
+	// Merge labels with existing to avoid losing data
+	existing, _ := jiraGetIssueLabels(ctx, cfg, issueKey)
+	desired := uniqueStrings(append(existing, []string{"github", "cert-manager", fmt.Sprintf("milestone:%s", cfg.GitHubMilestone)}...))
+
+	var desc *jiraADFDoc
+	if !cfg.JiraSkipDescription {
+		desc = buildJiraADFDescription(is)
+	}
+	fields := map[string]any{
+		"summary": summary,
+		"labels":  desired,
+	}
+	if desc != nil {
+		fields["description"] = desc
+	}
+	payload := jiraIssueCreateRequest{Fields: fields}
+
+	b, _ := json.Marshal(payload)
+	reqURL := fmt.Sprintf("%s/rest/api/3/issue/%s", strings.TrimRight(cfg.JiraBaseURL, "/"), url.PathEscape(issueKey))
+	req, _ := http.NewRequestWithContext(ctx, http.MethodPut, reqURL, strings.NewReader(string(b)))
+	req.Header.Set("Authorization", jiraAuthHeader(cfg.JiraEmail, cfg.JiraAPIToken))
+	req.Header.Set("Accept", "application/json")
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode == 204 {
+		return nil
+	}
+	// Retry without description if 400
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, 8192))
+	if resp.StatusCode == 400 && !cfg.JiraSkipDescription && desc != nil {
+		payload.Fields["description"] = nil
+		b2, _ := json.Marshal(payload)
+		req2, _ := http.NewRequestWithContext(ctx, http.MethodPut, reqURL, strings.NewReader(string(b2)))
+		req2.Header.Set("Authorization", jiraAuthHeader(cfg.JiraEmail, cfg.JiraAPIToken))
+		req2.Header.Set("Accept", "application/json")
+		req2.Header.Set("Content-Type", "application/json")
+		resp2, err2 := client.Do(req2)
+		if err2 != nil {
+			return fmt.Errorf("jira update retry failed: %v (first: %s)", err2, string(body))
+		}
+		defer resp2.Body.Close()
+		if resp2.StatusCode == 204 {
+			return nil
+		}
+		body2, _ := io.ReadAll(io.LimitReader(resp2.Body, 8192))
+		return fmt.Errorf("jira update status %d: %s | retry without description status %d: %s", resp.StatusCode, string(body), resp2.StatusCode, string(body2))
+	}
+	return fmt.Errorf("jira update status %d: %s", resp.StatusCode, string(body))
+}
+
+func jiraGetIssueLabels(ctx context.Context, cfg config, issueKey string) ([]string, error) {
+	client := &http.Client{Timeout: cfg.HTTPTimeout}
+	reqURL := fmt.Sprintf("%s/rest/api/3/issue/%s?fields=labels", strings.TrimRight(cfg.JiraBaseURL, "/"), url.PathEscape(issueKey))
+	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, reqURL, nil)
+	req.Header.Set("Authorization", jiraAuthHeader(cfg.JiraEmail, cfg.JiraAPIToken))
+	req.Header.Set("Accept", "application/json")
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		b, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		return nil, fmt.Errorf("jira get issue labels status %d: %s", resp.StatusCode, string(b))
+	}
+	var out struct {
+		Fields struct {
+			Labels []string `json:"labels"`
+		} `json:"fields"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return nil, err
+	}
+	return out.Fields.Labels, nil
+}
+
 func jiraAddRemoteLink(ctx context.Context, cfg config, issueKey, urlStr, title string) error {
 	client := &http.Client{Timeout: cfg.HTTPTimeout}
 	payload := jiraRemoteLinkRequest{Object: jiraRemoteLinkObject{URL: urlStr, Title: title}}
@@ -453,6 +542,149 @@ func jiraAddRemoteLink(ctx context.Context, cfg config, issueKey, urlStr, title 
 		return fmt.Errorf("jira remotelink status %d: %s", resp.StatusCode, string(body))
 	}
 	return nil
+}
+
+// buildCreateFieldsMap composes the fields map for creating a Jira issue,
+// augmenting with required fields from CreateMeta when possible.
+func buildCreateFieldsMap(ctx context.Context, cfg config, is ghIssue) (map[string]any, error) {
+	summary := fmt.Sprintf("cert-manager#%d: %s", is.Number, truncate(is.Title, 200))
+	labels := uniqueStrings([]string{"github", "cert-manager", fmt.Sprintf("milestone:%s", cfg.GitHubMilestone)})
+	fields := map[string]any{
+		"summary": summary,
+		"labels":  labels,
+	}
+	if !cfg.JiraSkipDescription {
+		if desc := buildJiraADFDescription(is); desc != nil {
+			fields["description"] = desc
+		}
+	}
+
+	// Project/issuetype references
+	if cfg.JiraProjectID != "" {
+		fields["project"] = map[string]any{"id": cfg.JiraProjectID}
+	} else {
+		fields["project"] = map[string]any{"key": cfg.JiraProjectKey}
+	}
+	if cfg.JiraIssueTypeID != "" {
+		fields["issuetype"] = map[string]any{"id": cfg.JiraIssueTypeID}
+	} else {
+		fields["issuetype"] = map[string]any{"name": cfg.JiraIssueType}
+	}
+
+	// Enhance with required fields from CreateMeta
+	reqFields, err := fetchCreateMetaRequiredFields(ctx, cfg)
+	if err != nil {
+		return fields, nil // proceed without meta if it fails
+	}
+	enhanceFieldsWithMeta(fields, reqFields)
+	return fields, nil
+}
+
+// fetchCreateMetaRequiredFields fetches required fields for the configured project and issuetype.
+func fetchCreateMetaRequiredFields(ctx context.Context, cfg config) (map[string]jiraFieldMetaInfo, error) {
+	client := &http.Client{Timeout: cfg.HTTPTimeout}
+	base := fmt.Sprintf("%s/rest/api/3/issue/createmeta", strings.TrimRight(cfg.JiraBaseURL, "/"))
+	q := url.Values{}
+	if cfg.JiraProjectID != "" {
+		q.Set("projectIds", cfg.JiraProjectID)
+	} else if cfg.JiraProjectKey != "" {
+		q.Set("projectKeys", cfg.JiraProjectKey)
+	}
+	if cfg.JiraIssueTypeID != "" {
+		q.Set("issuetypeIds", cfg.JiraIssueTypeID)
+	} else if cfg.JiraIssueType != "" {
+		q.Set("issuetypeNames", cfg.JiraIssueType)
+	}
+	q.Set("expand", "projects.issuetypes.fields")
+	reqURL := base + "?" + q.Encode()
+	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, reqURL, nil)
+	req.Header.Set("Authorization", jiraAuthHeader(cfg.JiraEmail, cfg.JiraAPIToken))
+	req.Header.Set("Accept", "application/json")
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		b, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		return nil, fmt.Errorf("createmeta status %d: %s", resp.StatusCode, string(b))
+	}
+	var meta jiraCreateMetaResponse
+	if err := json.NewDecoder(resp.Body).Decode(&meta); err != nil {
+		return nil, err
+	}
+	for _, p := range meta.Projects {
+		for _, it := range p.Issuetypes {
+			if (cfg.JiraIssueTypeID != "" && it.ID == cfg.JiraIssueTypeID) || strings.EqualFold(it.Name, cfg.JiraIssueType) || cfg.JiraIssueType == "" {
+				return it.Fields, nil
+			}
+		}
+	}
+	return nil, fmt.Errorf("issuetype %q not found in createmeta", cfg.JiraIssueType)
+}
+
+// enhanceFieldsWithMeta adds minimal values for required fields not already present.
+func enhanceFieldsWithMeta(fields map[string]any, meta map[string]jiraFieldMetaInfo) {
+	skip := map[string]struct{}{
+		"summary": {}, "project": {}, "issuetype": {}, "labels": {}, "description": {},
+	}
+	for key, info := range meta {
+		if !info.Required {
+			continue
+		}
+		if _, ok := skip[key]; ok {
+			continue
+		}
+		if _, exists := fields[key]; exists {
+			continue
+		}
+
+		// Prefer default value
+		if info.DefaultValue != nil {
+			fields[key] = info.DefaultValue
+			continue
+		}
+		// Prefer first allowed value
+		if len(info.AllowedValues) > 0 {
+			// Handle arrays vs single
+			if info.Schema.Type == "array" {
+				v := normalizeAllowedValue(info.AllowedValues[0])
+				fields[key] = []any{v}
+			} else {
+				fields[key] = normalizeAllowedValue(info.AllowedValues[0])
+			}
+			continue
+		}
+		// Fallback by schema type
+		switch info.Schema.Type {
+		case "string":
+			fields[key] = "Auto"
+		case "number":
+			fields[key] = 0
+		case "date":
+			fields[key] = time.Now().Format("2006-01-02")
+		case "datetime":
+			fields[key] = time.Now().UTC().Format("2006-01-02T15:04:05.000+0000")
+		case "array":
+			fields[key] = []any{}
+		default:
+			// leave unset if we don't know
+		}
+	}
+}
+
+func normalizeAllowedValue(v map[string]any) any {
+	// Common shapes: {"id":"10000"}, {"value":"X"}, {"name":"X"}
+	if id, ok := v["id"]; ok {
+		return map[string]any{"id": id}
+	}
+	if val, ok := v["value"]; ok {
+		return map[string]any{"value": val}
+	}
+	if name, ok := v["name"]; ok {
+		return map[string]any{"name": name}
+	}
+	return v
 }
 
 func buildJiraADFDescription(is ghIssue) *jiraADFDoc {
