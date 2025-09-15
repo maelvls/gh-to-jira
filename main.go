@@ -11,7 +11,6 @@ import (
 	"net/http"
 	"net/url"
 	"os"
-	"regexp"
 	"strings"
 	"time"
 )
@@ -695,68 +694,10 @@ func buildJiraADFDescription(is ghIssue) *jiraADFDoc {
 	linkText := fmt.Sprintf("GitHub Issue #%d", is.Number)
 	nodes = append(nodes, paragraphWithLink(linkText, is.HTMLURL))
 
-	// Meta info
-	meta := fmt.Sprintf("State: %s\nLabels: %s", is.State, joinLabelNames(is.Labels))
-	for _, ln := range strings.Split(meta, "\n") {
-		if strings.TrimSpace(ln) == "" {
-			continue
-		}
-		nodes = append(nodes, paragraphText(ln))
-	}
-
-	// Separator
-	nodes = append(nodes, paragraphText("---"))
-
-	// Body content (best-effort: split lines) with truncation to avoid too many nodes
-	const maxBodyParagraphs = 120
-	const maxBodyChars = 8000
-	const maxLineChars = 500
-	cleaned := sanitizeUTF8(is.Body)
-	lines := strings.Split(cleaned, "\n")
-	paraCount := 0
-	charCount := 0
-	truncated := false
-	for _, ln := range lines {
-		if paraCount >= maxBodyParagraphs || charCount >= maxBodyChars {
-			truncated = true
-			break
-		}
-		// Skip empty lines to reduce node count
-		if strings.TrimSpace(ln) == "" {
-			continue
-		}
-		// Strip markdown heading markers
-		ln = stripMarkdownHeader(ln)
-		// Cap individual line length
-		if len(ln) > maxLineChars {
-			ln = ln[:maxLineChars]
-		}
-		// Enforce total char limit
-		if charCount+len(ln) > maxBodyChars {
-			ln = ln[:maxBodyChars-charCount]
-			truncated = true
-		}
-		nodes = append(nodes, paragraphText(ln))
-		paraCount++
-		charCount += len(ln)
-	}
-	if truncated {
-		nodes = append(nodes, paragraphText("(truncated)"))
-	}
-
 	return &jiraADFDoc{
 		Type:    "doc",
 		Version: 1,
 		Content: nodes,
-	}
-}
-
-func paragraphText(t string) jiraADFNode {
-	return jiraADFNode{
-		Type: "paragraph",
-		Content: []jiraADFNode{
-			{Type: "text", Text: t},
-		},
 	}
 }
 
@@ -767,17 +708,6 @@ func paragraphWithLink(text, href string) jiraADFNode {
 			{Type: "text", Text: text, Marks: []jiraADFMark{{Type: "link", Attrs: map[string]any{"href": href}}}},
 		},
 	}
-}
-
-func joinLabelNames(labels []ghLabel) string {
-	if len(labels) == 0 {
-		return ""
-	}
-	out := make([]string, 0, len(labels))
-	for _, l := range labels {
-		out = append(out, l.Name)
-	}
-	return strings.Join(out, ", ")
 }
 
 func truncate(s string, n int) string {
@@ -801,27 +731,4 @@ func uniqueStrings(in []string) []string {
 		}
 	}
 	return out
-}
-
-var mdHeaderRe = regexp.MustCompile(`^\s*#{1,6}\s*`)
-
-func stripMarkdownHeader(s string) string {
-	return mdHeaderRe.ReplaceAllString(s, "")
-}
-
-func sanitizeUTF8(s string) string {
-	// Replace NULs and ensure valid UTF-8 for JSON
-	s = strings.ReplaceAll(s, "\x00", " ")
-	if !json.Valid([]byte("\"" + s + "\"")) {
-		// Replace problematic runes (quick fallback)
-		b := make([]rune, 0, len(s))
-		for _, r := range s {
-			if r == '\uFFFD' || r == 0 {
-				continue
-			}
-			b = append(b, r)
-		}
-		return string(b)
-	}
-	return s
 }
