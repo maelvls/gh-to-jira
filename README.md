@@ -1,9 +1,9 @@
-gh-to-jira: Sync cert-manager issues (by milestone) to Jira
+gh-to-jira: Sync labelled cert-manager issues/PRs to Jira
 
 Overview
-- A small Go bot that creates a Jira ticket for each GitHub issue in `cert-manager/cert-manager` that belongs to milestone `"1.19"`.
+- A small Go bot that creates/updates Jira tickets for GitHub issues and PRs in `cert-manager/cert-manager` carrying a specific label (default `cybr`), polling every minute.
 - Uses GitHub REST API and Jira Cloud REST API v3 (ADF description, remote link back to GitHub).
-- Skips pull requests and avoids duplicates by searching Jira for a summary token like `cert-manager#<issue-number>`.
+- Avoids duplicates by searching Jira for a summary token like `cert-manager#<issue-number>`.
 
 Prerequisites
 - Go 1.22+
@@ -18,7 +18,7 @@ Environment Variables
 - `GITHUB_TOKEN` (required)
 - `GITHUB_OWNER` default: `cert-manager`
 - `GITHUB_REPO` default: `cert-manager`
-- `GITHUB_MILESTONE` default: `1.19` (title of the milestone)
+- `GITHUB_LABEL` default: `cybr`
 - `JIRA_BASE_URL`, `JIRA_EMAIL`, `JIRA_API_TOKEN`, `JIRA_PROJECT_KEY` (all required)
 - `JIRA_PROJECT_ID` optional; if set, used instead of `JIRA_PROJECT_KEY` when creating issues
 - `JIRA_ISSUE_TYPE` default: `Task` (name)
@@ -31,17 +31,19 @@ Run
 go run .
 ```
 
-What it does
-- Resolves the configured milestone title to its number, and lists all GitHub issues (state=all) in that milestone.
-- For each issue (skipping PRs):
-  - Checks Jira for an existing issue with summary containing `cert-manager#<n>` (uses POST `/rest/api/3/search/jql`, with legacy fallback).
+The bot runs continuously, polling GitHub every minute. Stop it with `Ctrl+C`.
+
+- Lists all GitHub issues and PRs (state=all) filtered by the configured label.
+- For each item:
+  - Checks Jira for an existing issue with summary containing `cert-manager#<n>` (uses GET `/rest/api/3/search/jql`, falls back to POST batch).
   - If not found, creates a Jira issue:
     - Summary: `cert-manager#<n>: <issue title>`
-    - Labels: `github`, `cert-manager`, `milestone:<title>`
-    - Description: ADF document linking to the GitHub issue and including metadata and body (omit with `JIRA_SKIP_DESCRIPTION=true`).
+    - Labels: `github`, `cert-manager`, `<label>`
+    - Description: ADF with a link to the GitHub item and a truncated copy of the body (omit with `JIRA_SKIP_DESCRIPTION=true`).
   - Adds a Jira remote link back to the GitHub issue.
+  - If the Jira ticket already exists, updates summary/labels/description.
 
 Notes
-- The description uses Atlassian Document Format (ADF); formatting is best-effort.
-- If your Jira instance enforces custom required fields, set up appropriate field defaults or extend the code to populate them.
-- The duplicate check is heuristic (by summary). If you already created issues with a different pattern, adjust `jiraFindExisting`.
+- The description uses Atlassian Document Format (ADF) with truncation to avoid oversized payloads.
+- If your Jira project requires additional fields, the bot fetches CreateMeta and auto-fills minimal valid values when creating.
+- Duplicate detection is based on summary token `cert-manager#<n>`. If you use a different convention, adjust `jiraFindExisting`.

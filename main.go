@@ -11,7 +11,9 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"os/signal"
 	"strings"
+	"syscall"
 	"time"
 )
 
@@ -30,10 +32,7 @@ type ghIssue struct {
 	State       string    `json:"state"`
 }
 
-type ghMilestone struct {
-	Number int    `json:"number"`
-	Title  string `json:"title"`
-}
+// Milestones removed; selection is driven by GitHub labels
 
 // Jira models (trimmed)
 type jiraIssueCreateRequest struct {
@@ -142,18 +141,40 @@ func main() {
 		log.Fatalf("config error: %v", err)
 	}
 
-	ctx := context.Background()
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	ticker := time.NewTicker(time.Minute)
+	defer ticker.Stop()
+
+	runCycle(ctx, cfg)
+
+	for {
+		select {
+		case <-ctx.Done():
+			log.Printf("shutdown signal received, exiting")
+			return
+		case <-ticker.C:
+			runCycle(ctx, cfg)
+		}
+	}
+}
+
+func runCycle(ctx context.Context, cfg config) {
+	start := time.Now()
 	issues, err := fetchGitHubIssues(ctx, cfg)
 	if err != nil {
-		log.Fatalf("github fetch error: %v", err)
+		log.Printf("github fetch error: %v", err)
+		return
 	}
 
-	log.Printf("found %d issues in milestone %q for %s/%s (state=all)", len(issues), cfg.GitHubMilestone, cfg.GitHubOwner, cfg.GitHubRepo)
+	log.Printf("fetched %d issues/PRs in %s/%s with label %q (state=all)", len(issues), cfg.GitHubOwner, cfg.GitHubRepo, cfg.GitHubLabel)
 
 	for _, is := range issues {
 		existsKey, err := jiraFindExisting(ctx, cfg, is.Number)
 		if err != nil {
 			log.Printf("warn: jira search failed for #%d: %v", is.Number, err)
+			continue
 		}
 		if existsKey != "" {
 			if cfg.DryRun {
@@ -183,15 +204,16 @@ func main() {
 			log.Printf("warn: adding remote link to %s failed: %v", key, err)
 		}
 	}
-	// done
+
+	log.Printf("cycle completed in %s", time.Since(start).Truncate(time.Millisecond))
 }
 
 // Config
 type config struct {
-	GitHubToken     string
-	GitHubOwner     string
-	GitHubRepo      string
-	GitHubMilestone string
+	GitHubToken string
+	GitHubOwner string
+	GitHubRepo  string
+	GitHubLabel string
 
 	JiraBaseURL         string
 	JiraEmail           string
@@ -211,7 +233,7 @@ func loadConfig() (config, error) {
 		GitHubToken:         os.Getenv("GITHUB_TOKEN"),
 		GitHubOwner:         getenvDefault("GITHUB_OWNER", "cert-manager"),
 		GitHubRepo:          getenvDefault("GITHUB_REPO", "cert-manager"),
-		GitHubMilestone:     getenvDefault("GITHUB_MILESTONE", "1.19"),
+		GitHubLabel:         getenvDefault("GITHUB_LABEL", "cybr"),
 		JiraBaseURL:         os.Getenv("JIRA_BASE_URL"),
 		JiraEmail:           os.Getenv("JIRA_EMAIL"),
 		JiraAPIToken:        os.Getenv("JIRA_API_TOKEN"),
@@ -247,13 +269,8 @@ func fetchGitHubIssues(ctx context.Context, cfg config) ([]ghIssue, error) {
 	perPage := 100
 	page := 1
 	base := fmt.Sprintf("https://api.github.com/repos/%s/%s/issues", url.PathEscape(cfg.GitHubOwner), url.PathEscape(cfg.GitHubRepo))
-	// resolve milestone number by title
-	msNum, err := fetchMilestoneNumber(ctx, cfg, cfg.GitHubMilestone)
-	if err != nil {
-		return nil, err
-	}
 	for {
-		reqURL := fmt.Sprintf("%s?state=all&milestone=%d&per_page=%d&page=%d", base, msNum, perPage, page)
+		reqURL := fmt.Sprintf("%s?state=all&labels=%s&per_page=%d&page=%d", base, url.QueryEscape(cfg.GitHubLabel), perPage, page)
 		req, _ := http.NewRequestWithContext(ctx, http.MethodGet, reqURL, nil)
 		req.Header.Set("Authorization", "Bearer "+cfg.GitHubToken)
 		req.Header.Set("Accept", "application/vnd.github+json")
@@ -284,43 +301,7 @@ func fetchGitHubIssues(ctx context.Context, cfg config) ([]ghIssue, error) {
 	return all, nil
 }
 
-// fetchMilestoneNumber returns the milestone number for a given title (state=all)
-func fetchMilestoneNumber(ctx context.Context, cfg config, title string) (int, error) {
-	client := &http.Client{Timeout: cfg.HTTPTimeout}
-	perPage := 100
-	page := 1
-	base := fmt.Sprintf("https://api.github.com/repos/%s/%s/milestones", url.PathEscape(cfg.GitHubOwner), url.PathEscape(cfg.GitHubRepo))
-	for {
-		reqURL := fmt.Sprintf("%s?state=all&per_page=%d&page=%d", base, perPage, page)
-		req, _ := http.NewRequestWithContext(ctx, http.MethodGet, reqURL, nil)
-		req.Header.Set("Authorization", "Bearer "+cfg.GitHubToken)
-		req.Header.Set("Accept", "application/vnd.github+json")
-		req.Header.Set("User-Agent", "gh-to-jira-bot")
-		resp, err := client.Do(req)
-		if err != nil {
-			return 0, err
-		}
-		defer resp.Body.Close()
-		if resp.StatusCode != 200 {
-			b, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
-			return 0, fmt.Errorf("github milestones status %d: %s", resp.StatusCode, string(b))
-		}
-		var items []ghMilestone
-		if err := json.NewDecoder(resp.Body).Decode(&items); err != nil {
-			return 0, err
-		}
-		for _, m := range items {
-			if m.Title == title {
-				return m.Number, nil
-			}
-		}
-		if len(items) < perPage {
-			break
-		}
-		page++
-	}
-	return 0, fmt.Errorf("milestone %q not found", title)
-}
+// milestone logic removed
 
 // Jira helper: basic auth header
 func jiraAuthHeader(email, token string) string {
@@ -444,7 +425,7 @@ func jiraUpdateFromGitHubIssue(ctx context.Context, cfg config, issueKey string,
 
 	// Merge labels with existing to avoid losing data
 	existing, _ := jiraGetIssueLabels(ctx, cfg, issueKey)
-	desired := uniqueStrings(append(existing, []string{"github", "cert-manager", fmt.Sprintf("milestone:%s", cfg.GitHubMilestone)}...))
+	desired := uniqueStrings(append(existing, []string{"github", "cert-manager", cfg.GitHubLabel}...))
 
 	var desc *jiraADFDoc
 	if !cfg.JiraSkipDescription {
@@ -547,7 +528,7 @@ func jiraAddRemoteLink(ctx context.Context, cfg config, issueKey, urlStr, title 
 // augmenting with required fields from CreateMeta when possible.
 func buildCreateFieldsMap(ctx context.Context, cfg config, is ghIssue) (map[string]any, error) {
 	summary := fmt.Sprintf("cert-manager#%d: %s", is.Number, truncate(is.Title, 200))
-	labels := uniqueStrings([]string{"github", "cert-manager", fmt.Sprintf("milestone:%s", cfg.GitHubMilestone)})
+	labels := uniqueStrings([]string{"github", "cert-manager", cfg.GitHubLabel})
 	fields := map[string]any{
 		"summary": summary,
 		"labels":  labels,
@@ -687,18 +668,39 @@ func normalizeAllowedValue(v map[string]any) any {
 }
 
 func buildJiraADFDescription(is ghIssue) *jiraADFDoc {
-	// Create a simple document with: link to GH, state, labels, and a truncated body
+	// Create a simple document with a link and truncated body
 	nodes := []jiraADFNode{}
-
-	// Title paragraph with link
-	linkText := fmt.Sprintf("GitHub Issue #%d", is.Number)
+	linkText := fmt.Sprintf("GitHub Item #%d", is.Number)
 	nodes = append(nodes, paragraphWithLink(linkText, is.HTMLURL))
 
-	return &jiraADFDoc{
-		Type:    "doc",
-		Version: 1,
-		Content: nodes,
+	// Truncated body: limit paragraphs and total chars
+	const maxBodyParagraphs = 120
+	const maxBodyChars = 8000
+	const maxLineChars = 500
+	cleaned := is.Body
+	lines := strings.Split(cleaned, "\n")
+	paraCount := 0
+	charCount := 0
+	for _, ln := range lines {
+		if paraCount >= maxBodyParagraphs || charCount >= maxBodyChars {
+			nodes = append(nodes, paragraphText("(truncated)"))
+			break
+		}
+		if strings.TrimSpace(ln) == "" {
+			continue
+		}
+		if len(ln) > maxLineChars {
+			ln = ln[:maxLineChars]
+		}
+		if charCount+len(ln) > maxBodyChars {
+			ln = ln[:maxBodyChars-charCount]
+		}
+		nodes = append(nodes, paragraphText(ln))
+		paraCount++
+		charCount += len(ln)
 	}
+
+	return &jiraADFDoc{Type: "doc", Version: 1, Content: nodes}
 }
 
 func paragraphWithLink(text, href string) jiraADFNode {
@@ -706,6 +708,15 @@ func paragraphWithLink(text, href string) jiraADFNode {
 		Type: "paragraph",
 		Content: []jiraADFNode{
 			{Type: "text", Text: text, Marks: []jiraADFMark{{Type: "link", Attrs: map[string]any{"href": href}}}},
+		},
+	}
+}
+
+func paragraphText(t string) jiraADFNode {
+	return jiraADFNode{
+		Type: "paragraph",
+		Content: []jiraADFNode{
+			{Type: "text", Text: t},
 		},
 	}
 }
