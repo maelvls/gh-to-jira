@@ -162,50 +162,79 @@ func main() {
 
 func runCycle(ctx context.Context, cfg config) {
 	start := time.Now()
-	issues, err := fetchGitHubIssues(ctx, cfg)
+	repos, err := resolveRepos(ctx, cfg)
 	if err != nil {
-		log.Printf("github fetch error: %v", err)
+		log.Printf("error resolving repositories: %v", err)
+		return
+	}
+	if len(repos) == 0 {
+		log.Printf("no repositories resolved for %s", cfg.GitHubOwner)
 		return
 	}
 
-	log.Printf("fetched %d issues/PRs in %s/%s with label %q (state=all)", len(issues), cfg.GitHubOwner, cfg.GitHubRepo, cfg.GitHubLabel)
+	for _, repo := range repos {
+		select {
+		case <-ctx.Done():
+			log.Printf("cycle interrupted while processing %s/%s", cfg.GitHubOwner, repo)
+			return
+		default:
+		}
 
-	for _, is := range issues {
-		existsKey, err := jiraFindExisting(ctx, cfg, is.Number)
+		issues, err := fetchGitHubIssues(ctx, cfg, repo)
 		if err != nil {
-			log.Printf("warn: jira search failed for #%d: %v", is.Number, err)
+			log.Printf("github fetch error for %s/%s: %v", cfg.GitHubOwner, repo, err)
 			continue
 		}
-		if existsKey != "" {
-			if cfg.DryRun {
-				log.Printf("[dry-run] would update Jira %s for #%d %q", existsKey, is.Number, is.Title)
+
+		log.Printf("fetched %d issues/PRs in %s/%s with label %q", len(issues), cfg.GitHubOwner, repo, cfg.GitHubLabel)
+
+		for _, is := range issues {
+			existsKey, err := jiraFindExisting(ctx, cfg, repo, is.Number)
+			if err != nil {
+				log.Printf("warn: jira search failed for %s/%s#%d: %v", cfg.GitHubOwner, repo, is.Number, err)
 				continue
 			}
-			if err := jiraUpdateFromGitHubIssue(ctx, cfg, existsKey, is); err != nil {
-				log.Printf("error: updating Jira %s for #%d failed: %v", existsKey, is.Number, err)
-			} else {
-				log.Printf("updated Jira issue %s for GitHub #%d", existsKey, is.Number)
+			if existsKey != "" {
+				if cfg.DryRun {
+					log.Printf("[dry-run] would update Jira %s for %s/%s#%d %q", existsKey, cfg.GitHubOwner, repo, is.Number, is.Title)
+					continue
+				}
+				if err := jiraUpdateFromGitHubIssue(ctx, cfg, existsKey, repo, is); err != nil {
+					log.Printf("error: updating Jira %s for %s/%s#%d failed: %v", existsKey, cfg.GitHubOwner, repo, is.Number, err)
+				} else {
+					log.Printf("updated Jira issue %s for %s/%s#%d", existsKey, cfg.GitHubOwner, repo, is.Number)
+				}
+				continue
 			}
-			continue
-		}
 
-		if cfg.DryRun {
-			log.Printf("[dry-run] would create Jira for #%d %q", is.Number, is.Title)
-			continue
-		}
-		key, err := jiraCreateFromGitHubIssue(ctx, cfg, is)
-		if err != nil {
-			log.Printf("error: creating Jira for #%d failed: %v", is.Number, err)
-			continue
-		}
-		log.Printf("created Jira issue %s for GitHub #%d", key, is.Number)
+			if cfg.DryRun {
+				log.Printf("[dry-run] would create Jira for %s/%s#%d %q", cfg.GitHubOwner, repo, is.Number, is.Title)
+				continue
+			}
+			key, err := jiraCreateFromGitHubIssue(ctx, cfg, repo, is)
+			if err != nil {
+				log.Printf("error: creating Jira for %s/%s#%d failed: %v", cfg.GitHubOwner, repo, is.Number, err)
+				continue
+			}
+			log.Printf("created Jira issue %s for %s/%s#%d", key, cfg.GitHubOwner, repo, is.Number)
 
-		if err := jiraAddRemoteLink(ctx, cfg, key, is.HTMLURL, is.Title); err != nil {
-			log.Printf("warn: adding remote link to %s failed: %v", key, err)
+			if err := jiraAddRemoteLink(ctx, cfg, key, is.HTMLURL, is.Title); err != nil {
+				log.Printf("warn: adding remote link to %s failed for %s/%s#%d: %v", key, cfg.GitHubOwner, repo, is.Number, err)
+			}
 		}
 	}
 
 	log.Printf("cycle completed in %s", time.Since(start).Truncate(time.Millisecond))
+}
+
+func resolveRepos(ctx context.Context, cfg config) ([]string, error) {
+	if len(cfg.GitHubRepos) > 0 {
+		return cfg.GitHubRepos, nil
+	}
+	if cfg.GitHubRepo != "" {
+		return []string{cfg.GitHubRepo}, nil
+	}
+	return listOrgRepos(ctx, cfg)
 }
 
 // Config
@@ -213,6 +242,7 @@ type config struct {
 	GitHubToken string
 	GitHubOwner string
 	GitHubRepo  string
+	GitHubRepos []string
 	GitHubLabel string
 
 	JiraBaseURL         string
@@ -232,7 +262,7 @@ func loadConfig() (config, error) {
 	cfg := config{
 		GitHubToken:         os.Getenv("GITHUB_TOKEN"),
 		GitHubOwner:         getenvDefault("GITHUB_OWNER", "cert-manager"),
-		GitHubRepo:          getenvDefault("GITHUB_REPO", "cert-manager"),
+		GitHubRepo:          os.Getenv("GITHUB_REPO"),
 		GitHubLabel:         getenvDefault("GITHUB_LABEL", "cybr"),
 		JiraBaseURL:         os.Getenv("JIRA_BASE_URL"),
 		JiraEmail:           os.Getenv("JIRA_EMAIL"),
@@ -244,6 +274,15 @@ func loadConfig() (config, error) {
 		JiraSkipDescription: strings.EqualFold(os.Getenv("JIRA_SKIP_DESCRIPTION"), "true"),
 		DryRun:              strings.EqualFold(os.Getenv("DRY_RUN"), "true"),
 		HTTPTimeout:         20 * time.Second,
+	}
+
+	if reposEnv := os.Getenv("GITHUB_REPOS"); reposEnv != "" {
+		parts := strings.Split(reposEnv, ",")
+		for _, p := range parts {
+			if trimmed := strings.TrimSpace(p); trimmed != "" {
+				cfg.GitHubRepos = append(cfg.GitHubRepos, trimmed)
+			}
+		}
 	}
 
 	if cfg.GitHubToken == "" {
@@ -262,13 +301,57 @@ func getenvDefault(k, def string) string {
 	return def
 }
 
+func listOrgRepos(ctx context.Context, cfg config) ([]string, error) {
+	client := &http.Client{Timeout: cfg.HTTPTimeout}
+	perPage := 100
+	page := 1
+	var repos []string
+	base := fmt.Sprintf("https://api.github.com/orgs/%s/repos", url.PathEscape(cfg.GitHubOwner))
+	for {
+		reqURL := fmt.Sprintf("%s?per_page=%d&page=%d", base, perPage, page)
+		req, _ := http.NewRequestWithContext(ctx, http.MethodGet, reqURL, nil)
+		req.Header.Set("Authorization", "Bearer "+cfg.GitHubToken)
+		req.Header.Set("Accept", "application/vnd.github+json")
+		req.Header.Set("User-Agent", "gh-to-jira-bot")
+		resp, err := client.Do(req)
+		if err != nil {
+			return nil, err
+		}
+		body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+		resp.Body.Close()
+		if err != nil {
+			return nil, err
+		}
+		if resp.StatusCode != 200 {
+			return nil, fmt.Errorf("github repos: status %d: %s", resp.StatusCode, string(body))
+		}
+		var pageItems []struct {
+			Name string `json:"name"`
+		}
+		if err := json.Unmarshal(body, &pageItems); err != nil {
+			return nil, err
+		}
+		if len(pageItems) == 0 {
+			break
+		}
+		for _, repo := range pageItems {
+			repos = append(repos, repo.Name)
+		}
+		if len(pageItems) < perPage {
+			break
+		}
+		page++
+	}
+	return repos, nil
+}
+
 // GitHub client
-func fetchGitHubIssues(ctx context.Context, cfg config) ([]ghIssue, error) {
+func fetchGitHubIssues(ctx context.Context, cfg config, repo string) ([]ghIssue, error) {
 	client := &http.Client{Timeout: cfg.HTTPTimeout}
 	var all []ghIssue
 	perPage := 100
 	page := 1
-	base := fmt.Sprintf("https://api.github.com/repos/%s/%s/issues", url.PathEscape(cfg.GitHubOwner), url.PathEscape(cfg.GitHubRepo))
+	base := fmt.Sprintf("https://api.github.com/repos/%s/%s/issues", url.PathEscape(cfg.GitHubOwner), url.PathEscape(repo))
 	for {
 		reqURL := fmt.Sprintf("%s?state=all&labels=%s&per_page=%d&page=%d", base, url.QueryEscape(cfg.GitHubLabel), perPage, page)
 		req, _ := http.NewRequestWithContext(ctx, http.MethodGet, reqURL, nil)
@@ -279,13 +362,16 @@ func fetchGitHubIssues(ctx context.Context, cfg config) ([]ghIssue, error) {
 		if err != nil {
 			return nil, err
 		}
-		defer resp.Body.Close()
+		body, err := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
+		resp.Body.Close()
+		if err != nil {
+			return nil, err
+		}
 		if resp.StatusCode != 200 {
-			b, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
-			return nil, fmt.Errorf("github: status %d: %s", resp.StatusCode, string(b))
+			return nil, fmt.Errorf("github: status %d: %s", resp.StatusCode, string(body))
 		}
 		var pageItems []ghIssue
-		if err := json.NewDecoder(resp.Body).Decode(&pageItems); err != nil {
+		if err := json.Unmarshal(body, &pageItems); err != nil {
 			return nil, err
 		}
 
@@ -309,11 +395,10 @@ func jiraAuthHeader(email, token string) string {
 	return "Basic " + base64.StdEncoding.EncodeToString([]byte(raw))
 }
 
-func jiraFindExisting(ctx context.Context, cfg config, ghNumber int) (string, error) {
+func jiraFindExisting(ctx context.Context, cfg config, repo string, ghNumber int) (string, error) {
 	client := &http.Client{Timeout: cfg.HTTPTimeout}
-	token := fmt.Sprintf("cert-manager#%d", ghNumber)
-	jql := fmt.Sprintf(`project = %s AND summary ~ "%s"`, cfg.JiraProjectKey, token)
-	// Preferred per docs: GET /rest/api/3/search/jql
+	token := escapeJQLString(summaryPrefix(cfg.GitHubOwner, repo, ghNumber))
+	jql := fmt.Sprintf(`project = %s AND environment ~ "%s"`, cfg.JiraProjectKey, token)
 	reqURL := fmt.Sprintf("%s/rest/api/3/search/jql?jql=%s&maxResults=2&fields=id,key", strings.TrimRight(cfg.JiraBaseURL, "/"), url.QueryEscape(jql))
 	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, reqURL, nil)
 	req.Header.Set("Authorization", jiraAuthHeader(cfg.JiraEmail, cfg.JiraAPIToken))
@@ -330,10 +415,9 @@ func jiraFindExisting(ctx context.Context, cfg config, ghNumber int) (string, er
 				return "", nil
 			}
 		}
-		// If removed/unsupported, try POST batch next
 	}
 
-	// Fallback: POST /rest/api/3/search/jql (batch)
+	// Fallback: POST search
 	payload := jiraJQLBatchRequest{Queries: []jiraJQLQuery{{
 		JQL:        jql,
 		StartAt:    0,
@@ -353,21 +437,21 @@ func jiraFindExisting(ctx context.Context, cfg config, ghNumber int) (string, er
 	defer resp.Body.Close()
 	if resp.StatusCode != 200 {
 		bdy, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
-		return "", fmt.Errorf("jira search (jql batch) status %d: %s", resp.StatusCode, string(bdy))
+		return "", fmt.Errorf("jira search status %d: %s", resp.StatusCode, string(bdy))
 	}
-	var outBatch jiraJQLBatchResponse
-	if err := json.NewDecoder(resp.Body).Decode(&outBatch); err != nil {
+	var out jiraJQLBatchResponse
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
 		return "", err
 	}
-	if len(outBatch.Results) > 0 && len(outBatch.Results[0].Issues) > 0 {
-		return outBatch.Results[0].Issues[0].Key, nil
+	if len(out.Results) > 0 && len(out.Results[0].Issues) > 0 {
+		return out.Results[0].Issues[0].Key, nil
 	}
 	return "", nil
 }
 
-func jiraCreateFromGitHubIssue(ctx context.Context, cfg config, is ghIssue) (string, error) {
+func jiraCreateFromGitHubIssue(ctx context.Context, cfg config, repo string, is ghIssue) (string, error) {
 	client := &http.Client{Timeout: cfg.HTTPTimeout}
-	fields, err := buildCreateFieldsMap(ctx, cfg, is)
+	fields, err := buildCreateFieldsMap(ctx, cfg, repo, is)
 	if err != nil {
 		return "", err
 	}
@@ -418,27 +502,19 @@ func jiraCreateFromGitHubIssue(ctx context.Context, cfg config, is ghIssue) (str
 	return out.Key, nil
 }
 
-// jiraUpdateFromGitHubIssue updates summary, labels, and description of an existing Jira issue
-func jiraUpdateFromGitHubIssue(ctx context.Context, cfg config, issueKey string, is ghIssue) error {
+// jiraUpdateFromGitHubIssue updates labels of an existing Jira issue while
+// leaving summary/description untouched by default.
+func jiraUpdateFromGitHubIssue(ctx context.Context, cfg config, issueKey string, repo string, is ghIssue) error {
 	client := &http.Client{Timeout: cfg.HTTPTimeout}
-	summary := fmt.Sprintf("cert-manager#%d: %s", is.Number, truncate(is.Title, 200))
 
 	// Merge labels with existing to avoid losing data
 	existing, _ := jiraGetIssueLabels(ctx, cfg, issueKey)
-	desired := uniqueStrings(append(existing, []string{"github", "cert-manager", cfg.GitHubLabel}...))
+	desired := uniqueStrings(append(existing, []string{"github", "cert-manager", cfg.GitHubLabel, fmt.Sprintf("repo:%s", repo)}...))
 
-	var desc *jiraADFDoc
-	if !cfg.JiraSkipDescription {
-		desc = buildJiraADFDescription(is)
-	}
-	fields := map[string]any{
-		"summary": summary,
-		"labels":  desired,
-	}
-	if desc != nil {
-		fields["description"] = desc
-	}
-	payload := jiraIssueCreateRequest{Fields: fields}
+	payload := jiraIssueCreateRequest{Fields: map[string]any{
+		"labels":      desired,
+		"environment": buildEnvironmentADF(cfg.GitHubOwner, repo, is.Number, is.HTMLURL),
+	}}
 
 	b, _ := json.Marshal(payload)
 	reqURL := fmt.Sprintf("%s/rest/api/3/issue/%s", strings.TrimRight(cfg.JiraBaseURL, "/"), url.PathEscape(issueKey))
@@ -454,26 +530,7 @@ func jiraUpdateFromGitHubIssue(ctx context.Context, cfg config, issueKey string,
 	if resp.StatusCode == 204 {
 		return nil
 	}
-	// Retry without description if 400
 	body, _ := io.ReadAll(io.LimitReader(resp.Body, 8192))
-	if resp.StatusCode == 400 && !cfg.JiraSkipDescription && desc != nil {
-		payload.Fields["description"] = nil
-		b2, _ := json.Marshal(payload)
-		req2, _ := http.NewRequestWithContext(ctx, http.MethodPut, reqURL, strings.NewReader(string(b2)))
-		req2.Header.Set("Authorization", jiraAuthHeader(cfg.JiraEmail, cfg.JiraAPIToken))
-		req2.Header.Set("Accept", "application/json")
-		req2.Header.Set("Content-Type", "application/json")
-		resp2, err2 := client.Do(req2)
-		if err2 != nil {
-			return fmt.Errorf("jira update retry failed: %v (first: %s)", err2, string(body))
-		}
-		defer resp2.Body.Close()
-		if resp2.StatusCode == 204 {
-			return nil
-		}
-		body2, _ := io.ReadAll(io.LimitReader(resp2.Body, 8192))
-		return fmt.Errorf("jira update status %d: %s | retry without description status %d: %s", resp.StatusCode, string(body), resp2.StatusCode, string(body2))
-	}
 	return fmt.Errorf("jira update status %d: %s", resp.StatusCode, string(body))
 }
 
@@ -526,15 +583,16 @@ func jiraAddRemoteLink(ctx context.Context, cfg config, issueKey, urlStr, title 
 
 // buildCreateFieldsMap composes the fields map for creating a Jira issue,
 // augmenting with required fields from CreateMeta when possible.
-func buildCreateFieldsMap(ctx context.Context, cfg config, is ghIssue) (map[string]any, error) {
-	summary := fmt.Sprintf("cert-manager#%d: %s", is.Number, truncate(is.Title, 200))
-	labels := uniqueStrings([]string{"github", "cert-manager", cfg.GitHubLabel})
+func buildCreateFieldsMap(ctx context.Context, cfg config, repo string, is ghIssue) (map[string]any, error) {
+	summary := buildSummary(repo, is.Number, is.Title)
+	labels := uniqueStrings([]string{"github", "cert-manager", cfg.GitHubLabel, fmt.Sprintf("repo:%s", repo)})
 	fields := map[string]any{
 		"summary": summary,
 		"labels":  labels,
 	}
+	fields["environment"] = buildEnvironmentADF(cfg.GitHubOwner, repo, is.Number, is.HTMLURL)
 	if !cfg.JiraSkipDescription {
-		if desc := buildJiraADFDescription(is); desc != nil {
+		if desc := buildJiraADFDescription(cfg.GitHubOwner, repo, is); desc != nil {
 			fields["description"] = desc
 		}
 	}
@@ -667,40 +725,31 @@ func normalizeAllowedValue(v map[string]any) any {
 	return v
 }
 
-func buildJiraADFDescription(is ghIssue) *jiraADFDoc {
-	// Create a simple document with a link and truncated body
-	nodes := []jiraADFNode{}
-	linkText := fmt.Sprintf("GitHub Item #%d", is.Number)
-	nodes = append(nodes, paragraphWithLink(linkText, is.HTMLURL))
-
-	// Truncated body: limit paragraphs and total chars
-	const maxBodyParagraphs = 120
-	const maxBodyChars = 8000
-	const maxLineChars = 500
-	cleaned := is.Body
-	lines := strings.Split(cleaned, "\n")
-	paraCount := 0
-	charCount := 0
-	for _, ln := range lines {
-		if paraCount >= maxBodyParagraphs || charCount >= maxBodyChars {
-			nodes = append(nodes, paragraphText("(truncated)"))
-			break
-		}
-		if strings.TrimSpace(ln) == "" {
-			continue
-		}
-		if len(ln) > maxLineChars {
-			ln = ln[:maxLineChars]
-		}
-		if charCount+len(ln) > maxBodyChars {
-			ln = ln[:maxBodyChars-charCount]
-		}
-		nodes = append(nodes, paragraphText(ln))
-		paraCount++
-		charCount += len(ln)
+func buildJiraADFDescription(owner, repo string, is ghIssue) *jiraADFDoc {
+	linkText := fmt.Sprintf("GitHub %s/%s#%d", owner, repo, is.Number)
+	return &jiraADFDoc{
+		Type:    "doc",
+		Version: 1,
+		Content: []jiraADFNode{paragraphWithLink(linkText, is.HTMLURL)},
 	}
+}
 
-	return &jiraADFDoc{Type: "doc", Version: 1, Content: nodes}
+func buildEnvironmentADF(owner, repo string, number int, href string) *jiraADFDoc {
+	ref := summaryPrefix(owner, repo, number)
+	return &jiraADFDoc{
+		Type:    "doc",
+		Version: 1,
+		Content: []jiraADFNode{
+			{
+				Type: "paragraph",
+				Content: []jiraADFNode{
+					{Type: "text", Text: "Ref: "},
+					{Type: "text", Text: ref, Marks: []jiraADFMark{{Type: "link", Attrs: map[string]any{"href": href}}}},
+					{Type: "text", Text: " (do not edit this)"},
+				},
+			},
+		},
+	}
 }
 
 func paragraphWithLink(text, href string) jiraADFNode {
@@ -742,4 +791,23 @@ func uniqueStrings(in []string) []string {
 		}
 	}
 	return out
+}
+
+func summaryPrefix(owner, repo string, number int) string {
+	return fmt.Sprintf("%s/%s#%d", owner, repo, number)
+}
+
+func buildSummary(repo string, number int, title string) string {
+	prefix := fmt.Sprintf("%s#%d: ", repo, number)
+	remaining := 200 - len(prefix)
+	if remaining < 0 {
+		remaining = 0
+	}
+	return prefix + truncate(title, remaining)
+}
+
+func escapeJQLString(s string) string {
+	s = strings.ReplaceAll(s, `\`, `\\`)
+	s = strings.ReplaceAll(s, `"`, `\"`)
+	return s
 }

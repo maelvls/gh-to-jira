@@ -1,9 +1,9 @@
 gh-to-jira: Sync labelled cert-manager issues/PRs to Jira
 
 Overview
-- A small Go bot that creates/updates Jira tickets for GitHub issues and PRs in `cert-manager/cert-manager` carrying a specific label (default `cybr`), polling every minute.
+- A small Go bot that creates/updates Jira tickets for GitHub issues and PRs across the `cert-manager` organisation carrying a specific label (default `cybr`), polling every minute.
 - Uses GitHub REST API and Jira Cloud REST API v3 (ADF description, remote link back to GitHub).
-- Avoids duplicates by searching Jira for a summary token like `cert-manager#<issue-number>`.
+- Avoids duplicates by storing a Jira issue property that records the GitHub owner, repo, and issue/PR number.
 
 Prerequisites
 - Go 1.22+
@@ -17,8 +17,9 @@ Prerequisites
 Environment Variables
 - `GITHUB_TOKEN` (required)
 - `GITHUB_OWNER` default: `cert-manager`
-- `GITHUB_REPO` default: `cert-manager`
 - `GITHUB_LABEL` default: `cybr`
+- `GITHUB_REPO` optional; limit processing to a single repository
+- `GITHUB_REPOS` optional; comma-separated list of repositories to process (takes precedence over `GITHUB_REPO`)
 - `JIRA_BASE_URL`, `JIRA_EMAIL`, `JIRA_API_TOKEN`, `JIRA_PROJECT_KEY` (all required)
 - `JIRA_PROJECT_ID` optional; if set, used instead of `JIRA_PROJECT_KEY` when creating issues
 - `JIRA_ISSUE_TYPE` default: `Task` (name)
@@ -33,17 +34,27 @@ go run .
 
 The bot runs continuously, polling GitHub every minute. Stop it with `Ctrl+C`.
 
-- Lists all GitHub issues and PRs (state=all) filtered by the configured label.
+What it does
+- Lists all GitHub issues and PRs (state=all) in the selected repositories filtered by the configured label.
 - For each item:
-  - Checks Jira for an existing issue with summary containing `cert-manager#<n>` (uses GET `/rest/api/3/search/jql`, falls back to POST batch).
+  - Checks Jira for an existing issue whose *environment* field contains `<owner>/<repo>#<n>` (uses GET `/rest/api/3/search/jql`, falls back to POST batch).
   - If not found, creates a Jira issue:
-    - Summary: `cert-manager#<n>: <issue title>`
-    - Labels: `github`, `cert-manager`, `<label>`
-    - Description: ADF with a link to the GitHub item and a truncated copy of the body (omit with `JIRA_SKIP_DESCRIPTION=true`).
+    - Summary: `<repo>#<n>: <issue title>` (you can edit it later, the prefix helps identify the source)
+    - Labels: `github`, `cert-manager`, `<label>`, `repo:<repo>`
+    - Environment: `Ref: <owner>/<repo>#<n> (do not edit this)`
+    - Description: ADF document containing only a link back to the GitHub item (omit entirely with `JIRA_SKIP_DESCRIPTION=true`).
   - Adds a Jira remote link back to the GitHub issue.
-  - If the Jira ticket already exists, updates summary/labels/description.
+  - If the Jira ticket already exists, updates the label set and resets the environment field while leaving the summary/description untouched so you can edit them.
 
 Notes
-- The description uses Atlassian Document Format (ADF) with truncation to avoid oversized payloads.
+- The description uses Atlassian Document Format (ADF) and now only contains a single link back to the GitHub item.
 - If your Jira project requires additional fields, the bot fetches CreateMeta and auto-fills minimal valid values when creating.
-- Duplicate detection is based on summary token `cert-manager#<n>`. If you use a different convention, adjust `jiraFindExisting`.
+- Duplicate detection relies on the environment field containing `<owner>/<repo>#<n>`. The bot rewrites that field each cycle, so leave the “(do not edit this)” marker in place.
+- Jira issue properties could theoretically hold the GitHub identifiers, but making them searchable requires an administrator to configure entity-property indexing. Using the environment field avoids that administrative step.
+- Summaries and descriptions are only set on initial creation; subsequent syncs leave them untouched so you can edit them freely.
+
+Mapping details
+- **Summary**: `<repo>#<number>: <GitHub title>` (truncated to fit Jira’s limits). Feel free to tweak the descriptive text after the prefix.
+- **Labels**: Always include `github`, `cert-manager`, the configured GitHub label, and `repo:<repo>`, merged with any existing Jira labels.
+- **Environment**: `Ref: <owner>/<repo>#<number> (do not edit this)` rendered as clickable link back to GitHub – this is how the bot finds the ticket on subsequent runs.
+- **Description**: Single paragraph with a link labelled `GitHub <owner>/<repo>#<number>` pointing to the issue/PR; no body content is copied.
