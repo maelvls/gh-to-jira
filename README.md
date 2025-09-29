@@ -24,6 +24,9 @@ Environment Variables
 - `JIRA_PROJECT_ID` optional; if set, used instead of `JIRA_PROJECT_KEY` when creating issues
 - `JIRA_ISSUE_TYPE` default: `Task` (name)
 - `JIRA_ISSUE_TYPE_ID` optional; if set, used instead of `JIRA_ISSUE_TYPE` when creating issues
+- `JIRA_STATUS_OPEN` default: `To Do` (Jira status name for open GitHub issues/PRs)
+- `JIRA_STATUS_CLOSED` default: `Done` (Jira status name for closed/merged GitHub issues/PRs)
+- `JIRA_STATUS_DRAFT` default: `In Progress` (Jira status name for draft PRs)
 - `DRY_RUN` set to `true` to only print actions
 - `JIRA_SKIP_DESCRIPTION` set to `true` to omit the Jira description field (useful if your project requires fields or rejects ADF and returns 400)
 
@@ -45,6 +48,9 @@ What it does
     - Description: ADF document containing only a link back to the GitHub item (omit entirely with `JIRA_SKIP_DESCRIPTION=true`).
   - Adds a Jira remote link back to the GitHub issue.
   - If the Jira ticket already exists, updates the label set and resets the environment field while leaving the summary/description untouched so you can edit them.
+  - **Status Mapping**: Automatically transitions Jira tickets based on GitHub state changes:
+    - GitHub issues: `open` → any status except `JIRA_STATUS_CLOSED` (respects manual status changes), `closed` → `JIRA_STATUS_CLOSED` (default: "Done")
+    - GitHub PRs: `open` → any status except `JIRA_STATUS_CLOSED` (respects manual status changes), `draft` → `JIRA_STATUS_DRAFT` (default: "In Progress"), `closed` or `merged` → `JIRA_STATUS_CLOSED`
 
 Notes
 - The description uses Atlassian Document Format (ADF) and now only contains a single link back to the GitHub item.
@@ -52,6 +58,7 @@ Notes
 - Duplicate detection relies on the environment field containing `<owner>/<repo>#<n>`. The bot rewrites that field each cycle, so leave the “(do not edit this)” marker in place.
 - Jira issue properties could theoretically hold the GitHub identifiers, but making them searchable requires an administrator to configure entity-property indexing. Using the environment field avoids that administrative step.
 - Summaries and descriptions are only set on initial creation; subsequent syncs leave them untouched so you can edit them freely.
+- **Status transitions**: The bot only performs status transitions that are available in your Jira workflow. If a transition isn't available, it logs a warning and continues without error. Make sure your Jira workflow allows the transitions you need (e.g., "To Do" ↔ "Done", "In Progress" ↔ "Done").
 
 Mapping details
 - **Summary**: `<repo>#<number>: <GitHub title>` (truncated to fit Jira’s limits). Feel free to tweak the descriptive text after the prefix.

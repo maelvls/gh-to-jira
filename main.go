@@ -30,6 +30,8 @@ type ghIssue struct {
 	Labels      []ghLabel `json:"labels"`
 	PullRequest *struct{} `json:"pull_request,omitempty"`
 	State       string    `json:"state"`
+	Draft       bool      `json:"draft,omitempty"`
+	Merged      bool      `json:"merged,omitempty"`
 }
 
 // Milestones removed; selection is driven by GitHub labels
@@ -107,8 +109,14 @@ type jiraSearchResponse struct {
 }
 
 type jiraBasicIssue struct {
-	ID  string `json:"id"`
-	Key string `json:"key"`
+	ID     string `json:"id"`
+	Key    string `json:"key"`
+	Fields *struct {
+		Status *struct {
+			ID   string `json:"id"`
+			Name string `json:"name"`
+		} `json:"status,omitempty"`
+	} `json:"fields,omitempty"`
 }
 
 type jiraJQLBatchRequest struct {
@@ -133,6 +141,26 @@ type jiraRemoteLinkRequest struct {
 type jiraRemoteLinkObject struct {
 	URL   string `json:"url"`
 	Title string `json:"title"`
+}
+
+// Jira transition models
+type jiraTransition struct {
+	ID   string `json:"id"`
+	Name string `json:"name"`
+	To   struct {
+		ID   string `json:"id"`
+		Name string `json:"name"`
+	} `json:"to"`
+}
+
+type jiraTransitionsResponse struct {
+	Transitions []jiraTransition `json:"transitions"`
+}
+
+type jiraTransitionRequest struct {
+	Transition struct {
+		ID string `json:"id"`
+	} `json:"transition"`
 }
 
 func main() {
@@ -189,20 +217,41 @@ func runCycle(ctx context.Context, cfg config) {
 		log.Printf("fetched %d issues/PRs in %s/%s with label %q", len(issues), cfg.GitHubOwner, repo, cfg.GitHubLabel)
 
 		for _, is := range issues {
-			existsKey, err := jiraFindExisting(ctx, cfg, repo, is.Number)
+			// Use the new function that includes status information
+			existingIssue, err := jiraFindExistingWithStatus(ctx, cfg, repo, is.Number)
 			if err != nil {
 				log.Printf("warn: jira search failed for %s/%s#%d: %v", cfg.GitHubOwner, repo, is.Number, err)
 				continue
 			}
-			if existsKey != "" {
+			if existingIssue != nil {
 				if cfg.DryRun {
-					log.Printf("[dry-run] would update Jira %s for %s/%s#%d %q", existsKey, cfg.GitHubOwner, repo, is.Number, is.Title)
+					desiredStatus := getDesiredJiraStatus(cfg, is)
+					currentStatus := ""
+					if existingIssue.Fields != nil && existingIssue.Fields.Status != nil {
+						currentStatus = existingIssue.Fields.Status.Name
+					}
+					statusMsg := ""
+					if desiredStatus != "" {
+						if desiredStatus == "NOT_CLOSED" {
+							// Handle the "NOT_CLOSED" rule
+							if strings.EqualFold(currentStatus, cfg.JiraStatusClosed) {
+								statusMsg = fmt.Sprintf(" (status transition: %q -> %q - reopening)", currentStatus, cfg.JiraStatusOpen)
+							} else {
+								statusMsg = fmt.Sprintf(" (status: %q - acceptable for open GitHub item)", currentStatus)
+							}
+						} else if currentStatus != desiredStatus {
+							statusMsg = fmt.Sprintf(" (status transition: %q -> %q)", currentStatus, desiredStatus)
+						} else {
+							statusMsg = fmt.Sprintf(" (status: already %q)", currentStatus)
+						}
+					}
+					log.Printf("[dry-run] would update Jira %s for %s/%s#%d %q%s", existingIssue.Key, cfg.GitHubOwner, repo, is.Number, is.Title, statusMsg)
 					continue
 				}
-				if err := jiraUpdateFromGitHubIssue(ctx, cfg, existsKey, repo, is); err != nil {
-					log.Printf("error: updating Jira %s for %s/%s#%d failed: %v", existsKey, cfg.GitHubOwner, repo, is.Number, err)
+				if err := jiraUpdateFromGitHubIssueWithStatus(ctx, cfg, existingIssue, repo, is); err != nil {
+					log.Printf("error: updating Jira %s for %s/%s#%d failed: %v", existingIssue.Key, cfg.GitHubOwner, repo, is.Number, err)
 				} else {
-					log.Printf("updated Jira issue %s for %s/%s#%d", existsKey, cfg.GitHubOwner, repo, is.Number)
+					log.Printf("updated Jira issue %s for %s/%s#%d", existingIssue.Key, cfg.GitHubOwner, repo, is.Number)
 				}
 				continue
 			}
@@ -254,6 +303,11 @@ type config struct {
 	JiraIssueTypeID     string
 	JiraSkipDescription bool
 
+	// Status mapping configuration
+	JiraStatusOpen   string // Jira status name for open GitHub issues/PRs
+	JiraStatusClosed string // Jira status name for closed GitHub issues/PRs
+	JiraStatusDraft  string // Jira status name for draft PRs
+
 	DryRun      bool
 	HTTPTimeout time.Duration
 }
@@ -272,6 +326,9 @@ func loadConfig() (config, error) {
 		JiraIssueType:       getenvDefault("JIRA_ISSUE_TYPE", "Task"),
 		JiraIssueTypeID:     os.Getenv("JIRA_ISSUE_TYPE_ID"),
 		JiraSkipDescription: strings.EqualFold(os.Getenv("JIRA_SKIP_DESCRIPTION"), "true"),
+		JiraStatusOpen:      getenvDefault("JIRA_STATUS_OPEN", "To Do"),
+		JiraStatusClosed:    getenvDefault("JIRA_STATUS_CLOSED", "Done"),
+		JiraStatusDraft:     getenvDefault("JIRA_STATUS_DRAFT", "In Progress"),
 		DryRun:              strings.EqualFold(os.Getenv("DRY_RUN"), "true"),
 		HTTPTimeout:         20 * time.Second,
 	}
@@ -375,6 +432,19 @@ func fetchGitHubIssues(ctx context.Context, cfg config, repo string) ([]ghIssue,
 			return nil, err
 		}
 
+		// For PRs, fetch additional details including merged status
+		for i := range pageItems {
+			if pageItems[i].PullRequest != nil {
+				prDetails, err := fetchGitHubPRDetails(ctx, cfg, repo, pageItems[i].Number)
+				if err != nil {
+					log.Printf("warn: failed to fetch PR details for %s/%s#%d: %v", cfg.GitHubOwner, repo, pageItems[i].Number, err)
+				} else {
+					pageItems[i].Merged = prDetails.Merged
+					pageItems[i].Draft = prDetails.Draft
+				}
+			}
+		}
+
 		all = append(all, pageItems...)
 
 		// Pagination: stop when less than perPage
@@ -385,6 +455,30 @@ func fetchGitHubIssues(ctx context.Context, cfg config, repo string) ([]ghIssue,
 	}
 
 	return all, nil
+}
+
+// fetchGitHubPRDetails fetches additional PR details including merged status
+func fetchGitHubPRDetails(ctx context.Context, cfg config, repo string, prNumber int) (*ghIssue, error) {
+	client := &http.Client{Timeout: cfg.HTTPTimeout}
+	reqURL := fmt.Sprintf("https://api.github.com/repos/%s/%s/pulls/%d", url.PathEscape(cfg.GitHubOwner), url.PathEscape(repo), prNumber)
+	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, reqURL, nil)
+	req.Header.Set("Authorization", "Bearer "+cfg.GitHubToken)
+	req.Header.Set("Accept", "application/vnd.github+json")
+	req.Header.Set("User-Agent", "gh-to-jira-bot")
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
+		return nil, fmt.Errorf("github PR details: status %d: %s", resp.StatusCode, string(body))
+	}
+	var pr ghIssue
+	if err := json.NewDecoder(resp.Body).Decode(&pr); err != nil {
+		return nil, err
+	}
+	return &pr, nil
 }
 
 // milestone logic removed
@@ -399,7 +493,7 @@ func jiraFindExisting(ctx context.Context, cfg config, repo string, ghNumber int
 	client := &http.Client{Timeout: cfg.HTTPTimeout}
 	token := escapeJQLString(summaryPrefix(cfg.GitHubOwner, repo, ghNumber))
 	jql := fmt.Sprintf(`project = %s AND environment ~ "%s"`, cfg.JiraProjectKey, token)
-	reqURL := fmt.Sprintf("%s/rest/api/3/search/jql?jql=%s&maxResults=2&fields=id,key", strings.TrimRight(cfg.JiraBaseURL, "/"), url.QueryEscape(jql))
+	reqURL := fmt.Sprintf("%s/rest/api/3/search/jql?jql=%s&maxResults=2&fields=id,key,status", strings.TrimRight(cfg.JiraBaseURL, "/"), url.QueryEscape(jql))
 	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, reqURL, nil)
 	req.Header.Set("Authorization", jiraAuthHeader(cfg.JiraEmail, cfg.JiraAPIToken))
 	req.Header.Set("Accept", "application/json")
@@ -422,7 +516,7 @@ func jiraFindExisting(ctx context.Context, cfg config, repo string, ghNumber int
 		JQL:        jql,
 		StartAt:    0,
 		MaxResults: 2,
-		Fields:     []string{"id", "key"},
+		Fields:     []string{"id", "key", "status"},
 	}}}
 	b, _ := json.Marshal(payload)
 	reqURL = fmt.Sprintf("%s/rest/api/3/search/jql", strings.TrimRight(cfg.JiraBaseURL, "/"))
@@ -502,6 +596,60 @@ func jiraCreateFromGitHubIssue(ctx context.Context, cfg config, repo string, is 
 	return out.Key, nil
 }
 
+func jiraFindExistingWithStatus(ctx context.Context, cfg config, repo string, ghNumber int) (*jiraBasicIssue, error) {
+	client := &http.Client{Timeout: cfg.HTTPTimeout}
+	token := escapeJQLString(summaryPrefix(cfg.GitHubOwner, repo, ghNumber))
+	jql := fmt.Sprintf(`project = %s AND environment ~ "%s"`, cfg.JiraProjectKey, token)
+	reqURL := fmt.Sprintf("%s/rest/api/3/search/jql?jql=%s&maxResults=2&fields=id,key,status", strings.TrimRight(cfg.JiraBaseURL, "/"), url.QueryEscape(jql))
+	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, reqURL, nil)
+	req.Header.Set("Authorization", jiraAuthHeader(cfg.JiraEmail, cfg.JiraAPIToken))
+	req.Header.Set("Accept", "application/json")
+	resp, err := client.Do(req)
+	if err == nil && resp != nil {
+		defer resp.Body.Close()
+		if resp.StatusCode == 200 {
+			var out jiraSearchResponse
+			if err := json.NewDecoder(resp.Body).Decode(&out); err == nil {
+				if len(out.Issues) > 0 {
+					return &out.Issues[0], nil
+				}
+				return nil, nil
+			}
+		}
+	}
+
+	// Fallback: POST search
+	payload := jiraJQLBatchRequest{Queries: []jiraJQLQuery{{
+		JQL:        jql,
+		StartAt:    0,
+		MaxResults: 2,
+		Fields:     []string{"id", "key", "status"},
+	}}}
+	b, _ := json.Marshal(payload)
+	reqURL = fmt.Sprintf("%s/rest/api/3/search/jql", strings.TrimRight(cfg.JiraBaseURL, "/"))
+	req, _ = http.NewRequestWithContext(ctx, http.MethodPost, reqURL, strings.NewReader(string(b)))
+	req.Header.Set("Authorization", jiraAuthHeader(cfg.JiraEmail, cfg.JiraAPIToken))
+	req.Header.Set("Accept", "application/json")
+	req.Header.Set("Content-Type", "application/json")
+	resp, err = client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		bdy, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		return nil, fmt.Errorf("jira search status %d: %s", resp.StatusCode, string(bdy))
+	}
+	var out jiraJQLBatchResponse
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return nil, err
+	}
+	if len(out.Results) > 0 && len(out.Results[0].Issues) > 0 {
+		return &out.Results[0].Issues[0], nil
+	}
+	return nil, nil
+}
+
 // jiraUpdateFromGitHubIssue updates labels of an existing Jira issue while
 // leaving summary/description untouched by default.
 func jiraUpdateFromGitHubIssue(ctx context.Context, cfg config, issueKey string, repo string, is ghIssue) error {
@@ -532,6 +680,166 @@ func jiraUpdateFromGitHubIssue(ctx context.Context, cfg config, issueKey string,
 	}
 	body, _ := io.ReadAll(io.LimitReader(resp.Body, 8192))
 	return fmt.Errorf("jira update status %d: %s", resp.StatusCode, string(body))
+}
+
+// jiraUpdateFromGitHubIssueWithStatus updates labels and status of an existing Jira issue
+func jiraUpdateFromGitHubIssueWithStatus(ctx context.Context, cfg config, jiraIssue *jiraBasicIssue, repo string, is ghIssue) error {
+	// Update labels and environment first
+	if err := jiraUpdateFromGitHubIssue(ctx, cfg, jiraIssue.Key, repo, is); err != nil {
+		return err
+	}
+
+	// Determine desired Jira status based on GitHub state
+	desiredStatus := getDesiredJiraStatus(cfg, is)
+	if desiredStatus == "" {
+		return nil // No status mapping configured
+	}
+
+	// Get current status
+	currentStatus := ""
+	if jiraIssue.Fields != nil && jiraIssue.Fields.Status != nil {
+		currentStatus = jiraIssue.Fields.Status.Name
+	}
+
+	// Handle the "NOT_CLOSED" rule for open GitHub issues/PRs
+	if desiredStatus == "NOT_CLOSED" {
+		// For open GitHub items, we want any status except the closed status
+		if strings.EqualFold(currentStatus, cfg.JiraStatusClosed) {
+			// Current status is "Done/Closed" but GitHub is open - need to reopen
+			log.Printf("GitHub %s/%s#%d is open but Jira issue %s is %q, attempting to reopen to %q", 
+				cfg.GitHubOwner, repo, is.Number, jiraIssue.Key, currentStatus, cfg.JiraStatusOpen)
+			return jiraTransitionStatus(ctx, cfg, jiraIssue.Key, currentStatus, cfg.JiraStatusOpen)
+		} else {
+			// Current status is fine (not closed), leave it as is
+			log.Printf("GitHub %s/%s#%d is open and Jira issue %s is %q (acceptable, not changing)", 
+				cfg.GitHubOwner, repo, is.Number, jiraIssue.Key, currentStatus)
+			return nil
+		}
+	}
+
+	// Handle specific status transitions
+	if currentStatus == desiredStatus {
+		log.Printf("Jira issue %s already in correct status %q", jiraIssue.Key, currentStatus)
+		return nil // Already in correct status
+	}
+
+	// Log the status transition attempt
+	githubState := is.State
+	if is.PullRequest != nil {
+		if is.Merged {
+			githubState = "merged"
+		} else if is.Draft {
+			githubState = "draft"
+		}
+	}
+	log.Printf("GitHub %s/%s#%d is %q, attempting to transition Jira issue %s from %q to %q", 
+		cfg.GitHubOwner, repo, is.Number, githubState, jiraIssue.Key, currentStatus, desiredStatus)
+
+	// Perform status transition
+	return jiraTransitionStatus(ctx, cfg, jiraIssue.Key, currentStatus, desiredStatus)
+}
+
+// getDesiredJiraStatus maps GitHub issue/PR state to desired Jira status
+func getDesiredJiraStatus(cfg config, is ghIssue) string {
+	if is.PullRequest != nil {
+		// This is a PR
+		if is.Merged {
+			return cfg.JiraStatusClosed
+		}
+		if is.Draft {
+			return cfg.JiraStatusDraft
+		}
+		if is.State == "closed" {
+			return cfg.JiraStatusClosed
+		}
+		if is.State == "open" {
+			// For open PRs, any status except closed/done is acceptable
+			return "NOT_CLOSED" // Special marker meaning "any status except closed"
+		}
+	} else {
+		// This is an issue
+		if is.State == "closed" {
+			return cfg.JiraStatusClosed
+		}
+		if is.State == "open" {
+			// For open issues, any status except closed/done is acceptable
+			return "NOT_CLOSED" // Special marker meaning "any status except closed"
+		}
+	}
+	return ""
+}
+
+// jiraTransitionStatus transitions a Jira issue to the specified status
+func jiraTransitionStatus(ctx context.Context, cfg config, issueKey, currentStatus, targetStatus string) error {
+	// Get available transitions
+	transitions, err := jiraGetTransitions(ctx, cfg, issueKey)
+	if err != nil {
+		return fmt.Errorf("failed to get transitions for %s: %v", issueKey, err)
+	}
+
+	// Find transition to target status
+	var transitionID string
+	for _, t := range transitions {
+		if strings.EqualFold(t.To.Name, targetStatus) {
+			transitionID = t.ID
+			break
+		}
+	}
+
+	if transitionID == "" {
+		// No direct transition available to target status
+		log.Printf("warn: no transition available from %q to %q for %s", currentStatus, targetStatus, issueKey)
+		return nil
+	}
+
+	// Execute transition
+	client := &http.Client{Timeout: cfg.HTTPTimeout}
+	payload := jiraTransitionRequest{
+		Transition: struct {
+			ID string `json:"id"`
+		}{ID: transitionID},
+	}
+
+	b, _ := json.Marshal(payload)
+	reqURL := fmt.Sprintf("%s/rest/api/3/issue/%s/transitions", strings.TrimRight(cfg.JiraBaseURL, "/"), url.PathEscape(issueKey))
+	req, _ := http.NewRequestWithContext(ctx, http.MethodPost, reqURL, strings.NewReader(string(b)))
+	req.Header.Set("Authorization", jiraAuthHeader(cfg.JiraEmail, cfg.JiraAPIToken))
+	req.Header.Set("Accept", "application/json")
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode == 204 {
+		log.Printf("transitioned Jira issue %s from %q to %q", issueKey, currentStatus, targetStatus)
+		return nil
+	}
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, 8192))
+	return fmt.Errorf("jira transition status %d: %s", resp.StatusCode, string(body))
+}
+
+// jiraGetTransitions gets available transitions for a Jira issue
+func jiraGetTransitions(ctx context.Context, cfg config, issueKey string) ([]jiraTransition, error) {
+	client := &http.Client{Timeout: cfg.HTTPTimeout}
+	reqURL := fmt.Sprintf("%s/rest/api/3/issue/%s/transitions", strings.TrimRight(cfg.JiraBaseURL, "/"), url.PathEscape(issueKey))
+	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, reqURL, nil)
+	req.Header.Set("Authorization", jiraAuthHeader(cfg.JiraEmail, cfg.JiraAPIToken))
+	req.Header.Set("Accept", "application/json")
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		return nil, fmt.Errorf("jira get transitions status %d: %s", resp.StatusCode, string(body))
+	}
+	var out jiraTransitionsResponse
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return nil, err
+	}
+	return out.Transitions, nil
 }
 
 func jiraGetIssueLabels(ctx context.Context, cfg config, issueKey string) ([]string, error) {
