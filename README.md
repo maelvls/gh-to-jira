@@ -8,31 +8,106 @@ Overview
 Prerequisites
 - Go 1.22+
 - A GitHub token with `repo:read` scope in `GITHUB_TOKEN`.
-- A Jira Cloud site and a project key. Create a Jira API token and set the following env vars:
+- A Jira Cloud site and a project. Create a Jira API token and set the following env vars:
   - `JIRA_BASE_URL` (e.g., `https://your-domain.atlassian.net`)
   - `JIRA_EMAIL` (your Atlassian account email)
   - `JIRA_API_TOKEN` (API token)
-  - `JIRA_PROJECT_KEY` (e.g., `ABC`)
+- A `config.yaml` file with your project configuration (see Configuration File section below)
 
-Environment Variables
-- `GITHUB_TOKEN` (required)
-- `GITHUB_OWNER` default: `cert-manager`
-- `GITHUB_LABEL` default: `cybr`
-- `GITHUB_REPO` optional; limit processing to a single repository
-- `GITHUB_REPOS` optional; comma-separated list of repositories to process (takes precedence over `GITHUB_REPO`)
-- `JIRA_BASE_URL`, `JIRA_EMAIL`, `JIRA_API_TOKEN`, `JIRA_PROJECT_KEY` (all required)
-- `JIRA_PROJECT_ID` optional; if set, used instead of `JIRA_PROJECT_KEY` when creating issues
-- `JIRA_ISSUE_TYPE` default: `Task` (name)
-- `JIRA_ISSUE_TYPE_ID` optional; if set, used instead of `JIRA_ISSUE_TYPE` when creating issues
-- `JIRA_STATUS_OPEN` default: `To Do` (Jira status name for open GitHub issues/PRs)
-- `JIRA_STATUS_CLOSED` default: `Done` (Jira status name for closed/merged GitHub issues/PRs)
-- `JIRA_STATUS_DRAFT` default: `In Progress` (Jira status name for draft PRs)
-- `DRY_RUN` set to `true` to only print actions
-- `JIRA_SKIP_DESCRIPTION` set to `true` to omit the Jira description field (useful if your project requires fields or rejects ADF and returns 400)
+Environment Variables (Secrets Only)
+The following **secret** environment variables are required:
+- `GITHUB_TOKEN` (required) - GitHub token with repo access
+- `JIRA_BASE_URL` (required) - Your Jira instance URL
+- `JIRA_EMAIL` (required) - Your Atlassian account email  
+- `JIRA_API_TOKEN` (required) - Your Jira API token
+- `CONFIG_PATH` (optional) - Path to config file (default: `config.yaml`)
+
+**All other configuration has been moved to the config.yaml file.** Environment variables can still override YAML settings for backwards compatibility.
+
+Configuration File
+The bot uses a YAML configuration file (default: `config.yaml`) for all non-secret settings. This includes GitHub repository settings, Jira project configuration, status mappings, and user mappings.
+
+**Minimal `config.yaml` example:**
+```yaml
+# Required settings
+jira_project_key: "PROJ"             # Your Jira project key
+
+# GitHub settings (defaults shown)
+github_owner: "cert-manager"         # GitHub org/user
+github_label: "cybr"                 # Label to filter issues/PRs
+
+# User mappings
+github_to_jira_users:
+  john.doe: "557058:12345678-1234-1234-1234-123456789012"
+  
+cyberark_known_users:
+  - john.doe
+```
+
+**Complete `config.yaml` example:**
+```yaml
+# GitHub to Jira Configuration File
+# This file contains all non-secret configuration for the gh-to-jira bot
+
+# =============================================================================
+# GitHub Configuration
+# =============================================================================
+github_owner: "cert-manager"         # GitHub organization/user name
+# github_repo: ""                    # Single repository (leave empty to use github_repos or scan all)
+github_repos: []                     # List of specific repositories to monitor
+github_label: "cybr"                 # GitHub label to filter issues/PRs
+
+# =============================================================================
+# Jira Project Configuration  
+# =============================================================================
+jira_project_key: "PROJ"             # REQUIRED: Jira project key
+jira_issue_type: "Task"              # Jira issue type for created issues
+jira_skip_description: false         # Set to true to omit description field
+
+# =============================================================================
+# Jira Status Mapping
+# =============================================================================
+jira_status_open: "To Do"            # Status for open GitHub issues/PRs
+jira_status_closed: "Done"           # Status for closed/merged GitHub issues/PRs  
+jira_status_draft: "In Progress"     # Status for draft PRs
+jira_status_reopened: "Reopened"     # Status for reopening closed tickets
+jira_resolution: "Done"              # Resolution when closing tickets
+
+# =============================================================================
+# User Mappings
+# =============================================================================
+github_to_jira_users:
+  john.doe: "557058:12345678-1234-1234-1234-123456789012"
+  jane.smith: "557058:87654321-4321-4321-4321-210987654321"
+
+cyberark_known_users:
+  - john.doe
+  - jane.smith
+```
+
+To find Jira account IDs:
+1. Go to your Jira instance
+2. Navigate to People → View all people
+3. Click on a user's profile
+4. The account ID is in the URL: `https://yoursite.atlassian.net/jira/people/ACCOUNT_ID_HERE`
+
+**Note on Jira Resolution:** When closing tickets, Jira often requires a resolution to be set. Common resolution values include:
+- `"Done"` - Generic completion (default)
+- `"Fixed"` - For bugs or issues that were resolved
+- `"Resolved"` - General resolution
+- `"Won't Do"` - For tickets that won't be addressed
+- `"Duplicate"` - For duplicate tickets
+
+Check your Jira project settings to see which resolutions are available.
 
 Run
 ```
 go run .
+```
+
+**Dry-run mode:** To see what actions would be taken without making changes:
+```
+go run . --dry-run
 ```
 
 The bot runs continuously, polling GitHub every minute. Stop it with `Ctrl+C`.
@@ -46,11 +121,22 @@ What it does
     - Labels: `github`, `cert-manager`, `<label>`, `repo:<repo>`
     - Environment: `Ref: <owner>/<repo>#<n> (do not edit this)`
     - Description: ADF document containing only a link back to the GitHub item (omit entirely with `JIRA_SKIP_DESCRIPTION=true`).
+    - **Assignee**: Automatically determined based on GitHub issue/PR data (see Assignee Logic below).
   - Adds a Jira remote link back to the GitHub issue.
-  - If the Jira ticket already exists, updates the label set and resets the environment field while leaving the summary/description untouched so you can edit them.
+  - If the Jira ticket already exists, updates the label set, assignee, and resets the environment field while leaving the summary/description untouched so you can edit them.
   - **Status Mapping**: Automatically transitions Jira tickets based on GitHub state changes:
     - GitHub issues: `open` → any status except `JIRA_STATUS_CLOSED` (respects manual status changes), `closed` → `JIRA_STATUS_CLOSED` (default: "Done")
     - GitHub PRs: `open` → any status except `JIRA_STATUS_CLOSED` (respects manual status changes), `draft` → `JIRA_STATUS_DRAFT` (default: "In Progress"), `closed` or `merged` → `JIRA_STATUS_CLOSED`
+
+Assignee Logic
+The bot determines the Jira assignee based on GitHub issue/PR information with the following priority:
+1. **Author first (if known at CyberArk)**: If the GitHub issue/PR author is listed in the `cyberark_known_users` section of the YAML config, they get priority for assignment.
+2. **Assignees (if known at CyberArk)**: GitHub assignees who are known CyberArk users.
+3. **Reviewers for PRs (if known at CyberArk)**: For PRs, requested reviewers who are known CyberArk users.
+4. **Fallback to any assignee**: If no CyberArk users are found, falls back to any GitHub assignee.
+5. **Fallback to any reviewer**: For PRs, falls back to any requested reviewer.
+
+The GitHub username must be mapped to a Jira account ID in the `github_to_jira_users` section of the YAML config for the assignment to work.
 
 Notes
 - The description uses Atlassian Document Format (ADF) and now only contains a single link back to the GitHub item.
@@ -65,3 +151,4 @@ Mapping details
 - **Labels**: Always include `github`, `cert-manager`, the configured GitHub label, and `repo:<repo>`, merged with any existing Jira labels.
 - **Environment**: `Ref: <owner>/<repo>#<number> (do not edit this)` rendered as clickable link back to GitHub – this is how the bot finds the ticket on subsequent runs.
 - **Description**: Single paragraph with a link labelled `GitHub <owner>/<repo>#<number>` pointing to the issue/PR; no body content is copied.
+- **Assignee**: Automatically determined from GitHub issue/PR author, assignees, and reviewers (for PRs), prioritizing CyberArk known users. Requires mapping GitHub usernames to Jira account IDs.

@@ -1,0 +1,53 @@
+# GitHub to Jira Configuration File
+# This file contains all non-secret configuration for the gh-to-jira bot
+# Secret values (tokens, passwords, URLs) should still be set via environment variables
+
+# =============================================================================
+# GitHub Configuration
+# =============================================================================
+github_owner: "cert-manager"         # GitHub organization/user name
+# github_repo: ""                    # Single repository (leave empty to use github_repos or scan all)
+github_repos: []                     # List of specific repositories to monitor (leave empty to scan all)
+github_label: "cybr"                 # GitHub label to filter issues/PRs
+
+# =============================================================================
+# Jira Project Configuration  
+# =============================================================================
+jira_project_key: ""                 # REQUIRED: Jira project key (e.g., "PROJ")
+# jira_project_id: ""                # Optional: Jira project ID (if set, used instead of jira_project_key)
+jira_issue_type: "Task"              # Jira issue type for created issues
+# jira_issue_type_id: ""             # Optional: Jira issue type ID (if set, used instead of jira_issue_type)
+jira_skip_description: false         # Set to true to omit description field (useful for projects with required custom fields)
+
+# =============================================================================
+# Jira Status Mapping
+# =============================================================================
+jira_status_open: "To Do"            # Status for open GitHub issues/PRs
+jira_status_closed: "Done"           # Status for closed/merged GitHub issues/PRs  
+jira_status_draft: "In Progress"     # Status for draft PRs
+jira_status_reopened: "Reopened"     # Status for reopening closed tickets
+jira_resolution: "Done"              # Resolution to set when closing tickets (common: "Done", "Fixed", "Resolved")
+
+# =============================================================================
+# User Mappings
+# =============================================================================
+# Map GitHub usernames to Jira account IDs
+# To find Jira account IDs:
+# 1. Go to your Jira instance
+# 2. Navigate to People → View all people  
+# 3. Click on a user's profile
+# 4. The account ID is in the URL: https://yoursite.atlassian.net/jira/people/ACCOUNT_ID_HERE
+github_to_jira_users:
+  # Example mappings (replace with actual values):
+  # john.doe: "557058:12345678-1234-1234-1234-123456789012"
+  # jane.smith: "557058:87654321-4321-4321-4321-210987654321"
+  # cyberark-dev1: "557058:11111111-2222-3333-4444-555555555555"
+
+# List of GitHub usernames known to work at CyberArk
+# These users get priority for assignment
+cyberark_known_users:
+  # Example users (replace with actual usernames):
+  # - john.doe
+  # - jane.smith
+  # - cyberark-dev1
+  # - cyberark-dev2

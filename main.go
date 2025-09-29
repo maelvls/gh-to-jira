@@ -5,6 +5,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"flag"
 	"fmt"
 	"io"
 	"log"
@@ -15,11 +16,55 @@ import (
 	"strings"
 	"syscall"
 	"time"
+
+	"github.com/go-yaml/yaml"
 )
 
 // GitHub models (trimmed)
 type ghLabel struct {
 	Name string `json:"name"`
+}
+
+type ghUser struct {
+	Login string `json:"login"`
+	ID    int    `json:"id"`
+}
+
+type ghReviewer struct {
+	User *ghUser `json:"user,omitempty"`
+}
+
+type ghReviewRequest struct {
+	Users []ghUser `json:"users,omitempty"`
+}
+
+// UserConfig represents the YAML configuration for user mappings and application settings
+type UserConfig struct {
+	// GitHub configuration
+	GitHubOwner string   `yaml:"github_owner"`
+	GitHubRepo  string   `yaml:"github_repo"`
+	GitHubRepos []string `yaml:"github_repos"`
+	GitHubLabel string   `yaml:"github_label"`
+
+	// Jira project configuration
+	JiraProjectKey      string `yaml:"jira_project_key"`
+	JiraProjectID       string `yaml:"jira_project_id"`
+	JiraIssueType       string `yaml:"jira_issue_type"`
+	JiraIssueTypeID     string `yaml:"jira_issue_type_id"`
+	JiraSkipDescription bool   `yaml:"jira_skip_description"`
+
+	// Jira status mapping
+	JiraStatusOpen     string `yaml:"jira_status_open"`
+	JiraStatusClosed   string `yaml:"jira_status_closed"`
+	JiraStatusDraft    string `yaml:"jira_status_draft"`
+	JiraStatusReopened string `yaml:"jira_status_reopened"`
+
+	// Jira resolution (for closing tickets)
+	JiraResolution string `yaml:"jira_resolution"`
+
+	// User mappings
+	GitHubToJiraUsers  map[string]string `yaml:"github_to_jira_users"`
+	CyberArkKnownUsers []string          `yaml:"cyberark_known_users"`
 }
 
 type ghIssue struct {
@@ -32,6 +77,9 @@ type ghIssue struct {
 	State       string    `json:"state"`
 	Draft       bool      `json:"draft,omitempty"`
 	Merged      bool      `json:"merged,omitempty"`
+	User        *ghUser   `json:"user,omitempty"`      // Author
+	Assignee    *ghUser   `json:"assignee,omitempty"`  // Single assignee
+	Assignees   []ghUser  `json:"assignees,omitempty"` // Multiple assignees
 }
 
 // Milestones removed; selection is driven by GitHub labels
@@ -161,10 +209,15 @@ type jiraTransitionRequest struct {
 	Transition struct {
 		ID string `json:"id"`
 	} `json:"transition"`
+	Fields map[string]any `json:"fields,omitempty"`
 }
 
 func main() {
-	cfg, err := loadConfig()
+	// Parse command-line flags
+	var dryRun = flag.Bool("dry-run", false, "only print actions without making changes")
+	flag.Parse()
+
+	cfg, err := loadConfig(*dryRun)
 	if err != nil {
 		log.Fatalf("config error: %v", err)
 	}
@@ -196,31 +249,31 @@ func runCycle(ctx context.Context, cfg config) {
 		return
 	}
 	if len(repos) == 0 {
-		log.Printf("no repositories resolved for %s", cfg.GitHubOwner)
+		log.Printf("no repositories resolved for %s", cfg.UserConfig.GitHubOwner)
 		return
 	}
 
 	for _, repo := range repos {
 		select {
 		case <-ctx.Done():
-			log.Printf("cycle interrupted while processing %s/%s", cfg.GitHubOwner, repo)
+			log.Printf("cycle interrupted while processing %s/%s", cfg.UserConfig.GitHubOwner, repo)
 			return
 		default:
 		}
 
 		issues, err := fetchGitHubIssues(ctx, cfg, repo)
 		if err != nil {
-			log.Printf("github fetch error for %s/%s: %v", cfg.GitHubOwner, repo, err)
+			log.Printf("github fetch error for %s/%s: %v", cfg.UserConfig.GitHubOwner, repo, err)
 			continue
 		}
 
-		log.Printf("fetched %d issues/PRs in %s/%s with label %q", len(issues), cfg.GitHubOwner, repo, cfg.GitHubLabel)
+		log.Printf("fetched %d issues/PRs in %s/%s with label %q", len(issues), cfg.UserConfig.GitHubOwner, repo, cfg.UserConfig.GitHubLabel)
 
 		for _, is := range issues {
 			// Use the new function that includes status information
 			existingIssue, err := jiraFindExistingWithStatus(ctx, cfg, repo, is.Number)
 			if err != nil {
-				log.Printf("warn: jira search failed for %s/%s#%d: %v", cfg.GitHubOwner, repo, is.Number, err)
+				log.Printf("warn: jira search failed for %s/%s#%d: %v", cfg.UserConfig.GitHubOwner, repo, is.Number, err)
 				continue
 			}
 			if existingIssue != nil {
@@ -234,8 +287,8 @@ func runCycle(ctx context.Context, cfg config) {
 					if desiredStatus != "" {
 						if desiredStatus == "NOT_CLOSED" {
 							// Handle the "NOT_CLOSED" rule
-							if strings.EqualFold(currentStatus, cfg.JiraStatusClosed) {
-								statusMsg = fmt.Sprintf(" (status transition: %q -> %q - reopening)", currentStatus, cfg.JiraStatusOpen)
+							if strings.EqualFold(currentStatus, cfg.UserConfig.JiraStatusClosed) {
+								statusMsg = fmt.Sprintf(" (status transition: %q -> %q - reopening)", currentStatus, cfg.UserConfig.JiraStatusReopened)
 							} else {
 								statusMsg = fmt.Sprintf(" (status: %q - acceptable for open GitHub item)", currentStatus)
 							}
@@ -245,30 +298,46 @@ func runCycle(ctx context.Context, cfg config) {
 							statusMsg = fmt.Sprintf(" (status: already %q)", currentStatus)
 						}
 					}
-					log.Printf("[dry-run] would update Jira %s for %s/%s#%d %q%s", existingIssue.Key, cfg.GitHubOwner, repo, is.Number, is.Title, statusMsg)
+					assigneeInfo := ""
+					if assigneeAccountID, err := determineJiraAssignee(ctx, cfg, repo, is); err != nil {
+						assigneeInfo = " (assignee determination failed)"
+					} else if assigneeAccountID != "" {
+						assigneeInfo = fmt.Sprintf(" (would assign to: %s)", assigneeAccountID)
+					} else {
+						assigneeInfo = " (no assignee mapping found)"
+					}
+					log.Printf("[dry-run] would update Jira %s for %s/%s#%d %q%s%s", existingIssue.Key, cfg.UserConfig.GitHubOwner, repo, is.Number, is.Title, statusMsg, assigneeInfo)
 					continue
 				}
 				if err := jiraUpdateFromGitHubIssueWithStatus(ctx, cfg, existingIssue, repo, is); err != nil {
-					log.Printf("error: updating Jira %s for %s/%s#%d failed: %v", existingIssue.Key, cfg.GitHubOwner, repo, is.Number, err)
+					log.Printf("error: updating Jira %s for %s/%s#%d failed: %v", existingIssue.Key, cfg.UserConfig.GitHubOwner, repo, is.Number, err)
 				} else {
-					log.Printf("updated Jira issue %s for %s/%s#%d", existingIssue.Key, cfg.GitHubOwner, repo, is.Number)
+					log.Printf("updated Jira issue %s for %s/%s#%d", existingIssue.Key, cfg.UserConfig.GitHubOwner, repo, is.Number)
 				}
 				continue
 			}
 
 			if cfg.DryRun {
-				log.Printf("[dry-run] would create Jira for %s/%s#%d %q", cfg.GitHubOwner, repo, is.Number, is.Title)
+				assigneeInfo := ""
+				if assigneeAccountID, err := determineJiraAssignee(ctx, cfg, repo, is); err != nil {
+					assigneeInfo = " (assignee determination failed)"
+				} else if assigneeAccountID != "" {
+					assigneeInfo = fmt.Sprintf(" (would assign to: %s)", assigneeAccountID)
+				} else {
+					assigneeInfo = " (no assignee mapping found)"
+				}
+				log.Printf("[dry-run] would create Jira for %s/%s#%d %q%s", cfg.UserConfig.GitHubOwner, repo, is.Number, is.Title, assigneeInfo)
 				continue
 			}
 			key, err := jiraCreateFromGitHubIssue(ctx, cfg, repo, is)
 			if err != nil {
-				log.Printf("error: creating Jira for %s/%s#%d failed: %v", cfg.GitHubOwner, repo, is.Number, err)
+				log.Printf("error: creating Jira for %s/%s#%d failed: %v", cfg.UserConfig.GitHubOwner, repo, is.Number, err)
 				continue
 			}
-			log.Printf("created Jira issue %s for %s/%s#%d", key, cfg.GitHubOwner, repo, is.Number)
+			log.Printf("created Jira issue %s for %s/%s#%d", key, cfg.UserConfig.GitHubOwner, repo, is.Number)
 
 			if err := jiraAddRemoteLink(ctx, cfg, key, is.HTMLURL, is.Title); err != nil {
-				log.Printf("warn: adding remote link to %s failed for %s/%s#%d: %v", key, cfg.GitHubOwner, repo, is.Number, err)
+				log.Printf("warn: adding remote link to %s failed for %s/%s#%d: %v", key, cfg.UserConfig.GitHubOwner, repo, is.Number, err)
 			}
 		}
 	}
@@ -277,77 +346,115 @@ func runCycle(ctx context.Context, cfg config) {
 }
 
 func resolveRepos(ctx context.Context, cfg config) ([]string, error) {
-	if len(cfg.GitHubRepos) > 0 {
-		return cfg.GitHubRepos, nil
+	if len(cfg.UserConfig.GitHubRepos) > 0 {
+		return cfg.UserConfig.GitHubRepos, nil
 	}
-	if cfg.GitHubRepo != "" {
-		return []string{cfg.GitHubRepo}, nil
+	if cfg.UserConfig.GitHubRepo != "" {
+		return []string{cfg.UserConfig.GitHubRepo}, nil
 	}
 	return listOrgRepos(ctx, cfg)
 }
 
 // Config
 type config struct {
-	GitHubToken string
-	GitHubOwner string
-	GitHubRepo  string
-	GitHubRepos []string
-	GitHubLabel string
+	// Secret environment variables (not in YAML)
+	GitHubToken  string
+	JiraBaseURL  string
+	JiraEmail    string
+	JiraAPIToken string
 
-	JiraBaseURL         string
-	JiraEmail           string
-	JiraAPIToken        string
-	JiraProjectKey      string
-	JiraProjectID       string
-	JiraIssueType       string
-	JiraIssueTypeID     string
-	JiraSkipDescription bool
+	// Configuration loaded from YAML file
+	ConfigPath string     // Path to the YAML configuration file
+	UserConfig UserConfig // Loaded user configuration
 
-	// Status mapping configuration
-	JiraStatusOpen   string // Jira status name for open GitHub issues/PRs
-	JiraStatusClosed string // Jira status name for closed GitHub issues/PRs
-	JiraStatusDraft  string // Jira status name for draft PRs
+	// Runtime flags
+	DryRun bool
 
-	DryRun      bool
 	HTTPTimeout time.Duration
 }
 
-func loadConfig() (config, error) {
+func loadConfig(dryRun bool) (config, error) {
 	cfg := config{
-		GitHubToken:         os.Getenv("GITHUB_TOKEN"),
-		GitHubOwner:         getenvDefault("GITHUB_OWNER", "cert-manager"),
-		GitHubRepo:          os.Getenv("GITHUB_REPO"),
-		GitHubLabel:         getenvDefault("GITHUB_LABEL", "cybr"),
-		JiraBaseURL:         os.Getenv("JIRA_BASE_URL"),
-		JiraEmail:           os.Getenv("JIRA_EMAIL"),
-		JiraAPIToken:        os.Getenv("JIRA_API_TOKEN"),
-		JiraProjectKey:      os.Getenv("JIRA_PROJECT_KEY"),
-		JiraProjectID:       os.Getenv("JIRA_PROJECT_ID"),
-		JiraIssueType:       getenvDefault("JIRA_ISSUE_TYPE", "Task"),
-		JiraIssueTypeID:     os.Getenv("JIRA_ISSUE_TYPE_ID"),
-		JiraSkipDescription: strings.EqualFold(os.Getenv("JIRA_SKIP_DESCRIPTION"), "true"),
-		JiraStatusOpen:      getenvDefault("JIRA_STATUS_OPEN", "To Do"),
-		JiraStatusClosed:    getenvDefault("JIRA_STATUS_CLOSED", "Done"),
-		JiraStatusDraft:     getenvDefault("JIRA_STATUS_DRAFT", "In Progress"),
-		DryRun:              strings.EqualFold(os.Getenv("DRY_RUN"), "true"),
-		HTTPTimeout:         20 * time.Second,
+		// Only load secrets from environment variables
+		GitHubToken:  os.Getenv("GITHUB_TOKEN"),
+		JiraBaseURL:  os.Getenv("JIRA_BASE_URL"),
+		JiraEmail:    os.Getenv("JIRA_EMAIL"),
+		JiraAPIToken: os.Getenv("JIRA_API_TOKEN"),
+		ConfigPath:   getenvDefault("CONFIG_PATH", "config.yaml"),
+		DryRun:       dryRun,
+		HTTPTimeout:  20 * time.Second,
 	}
 
+	// Load user configuration from YAML file (includes all non-secret config)
+	if err := loadUserConfig(&cfg); err != nil {
+		return cfg, fmt.Errorf("failed to load config: %v", err)
+	}
+
+	// Allow environment variables to override YAML settings for backwards compatibility
 	if reposEnv := os.Getenv("GITHUB_REPOS"); reposEnv != "" {
 		parts := strings.Split(reposEnv, ",")
+		cfg.UserConfig.GitHubRepos = nil
 		for _, p := range parts {
 			if trimmed := strings.TrimSpace(p); trimmed != "" {
-				cfg.GitHubRepos = append(cfg.GitHubRepos, trimmed)
+				cfg.UserConfig.GitHubRepos = append(cfg.UserConfig.GitHubRepos, trimmed)
 			}
 		}
 	}
 
+	// Environment variable overrides for backwards compatibility
+	if v := os.Getenv("GITHUB_OWNER"); v != "" {
+		cfg.UserConfig.GitHubOwner = v
+	}
+	if v := os.Getenv("GITHUB_REPO"); v != "" {
+		cfg.UserConfig.GitHubRepo = v
+	}
+	if v := os.Getenv("GITHUB_LABEL"); v != "" {
+		cfg.UserConfig.GitHubLabel = v
+	}
+	if v := os.Getenv("JIRA_PROJECT_KEY"); v != "" {
+		cfg.UserConfig.JiraProjectKey = v
+	}
+	if v := os.Getenv("JIRA_PROJECT_ID"); v != "" {
+		cfg.UserConfig.JiraProjectID = v
+	}
+	if v := os.Getenv("JIRA_ISSUE_TYPE"); v != "" {
+		cfg.UserConfig.JiraIssueType = v
+	}
+	if v := os.Getenv("JIRA_ISSUE_TYPE_ID"); v != "" {
+		cfg.UserConfig.JiraIssueTypeID = v
+	}
+	if v := os.Getenv("JIRA_SKIP_DESCRIPTION"); v != "" {
+		cfg.UserConfig.JiraSkipDescription = strings.EqualFold(v, "true")
+	}
+	if v := os.Getenv("JIRA_STATUS_OPEN"); v != "" {
+		cfg.UserConfig.JiraStatusOpen = v
+	}
+	if v := os.Getenv("JIRA_STATUS_CLOSED"); v != "" {
+		cfg.UserConfig.JiraStatusClosed = v
+	}
+	if v := os.Getenv("JIRA_STATUS_DRAFT"); v != "" {
+		cfg.UserConfig.JiraStatusDraft = v
+	}
+	if v := os.Getenv("JIRA_STATUS_REOPENED"); v != "" {
+		cfg.UserConfig.JiraStatusReopened = v
+	}
+	if v := os.Getenv("JIRA_RESOLUTION"); v != "" {
+		cfg.UserConfig.JiraResolution = v
+	}
+
+	// Validate required secret environment variables
 	if cfg.GitHubToken == "" {
 		return cfg, errors.New("missing GITHUB_TOKEN")
 	}
-	if cfg.JiraBaseURL == "" || cfg.JiraEmail == "" || cfg.JiraAPIToken == "" || cfg.JiraProjectKey == "" {
-		return cfg, errors.New("missing one or more Jira envs: JIRA_BASE_URL, JIRA_EMAIL, JIRA_API_TOKEN, JIRA_PROJECT_KEY")
+	if cfg.JiraBaseURL == "" || cfg.JiraEmail == "" || cfg.JiraAPIToken == "" {
+		return cfg, errors.New("missing one or more Jira envs: JIRA_BASE_URL, JIRA_EMAIL, JIRA_API_TOKEN")
 	}
+
+	// Validate required YAML configuration
+	if cfg.UserConfig.JiraProjectKey == "" {
+		return cfg, errors.New("missing jira_project_key in config file or JIRA_PROJECT_KEY environment variable")
+	}
+
 	return cfg, nil
 }
 
@@ -358,12 +465,103 @@ func getenvDefault(k, def string) string {
 	return def
 }
 
+// loadUserConfig loads user configuration from a YAML file
+func loadUserConfig(cfg *config) error {
+	// Set defaults for all configuration values
+	cfg.UserConfig = UserConfig{
+		GitHubOwner:         "cert-manager",
+		GitHubLabel:         "cybr",
+		JiraIssueType:       "Task",
+		JiraStatusOpen:      "To Do",
+		JiraStatusClosed:    "Done",
+		JiraStatusDraft:     "In Progress",
+		JiraStatusReopened:  "Reopened",
+		JiraResolution:      "Done",
+		GitHubToJiraUsers:   make(map[string]string),
+		CyberArkKnownUsers:  []string{},
+		JiraSkipDescription: false,
+	}
+
+	// Check if file exists
+	if _, err := os.Stat(cfg.ConfigPath); os.IsNotExist(err) {
+		log.Printf("config file %s not found, using defaults", cfg.ConfigPath)
+		return nil
+	}
+
+	// Read the YAML file
+	data, err := os.ReadFile(cfg.ConfigPath)
+	if err != nil {
+		return fmt.Errorf("failed to read config file %s: %v", cfg.ConfigPath, err)
+	}
+
+	// Parse YAML and merge with defaults
+	var userConfig UserConfig
+	if err := yaml.Unmarshal(data, &userConfig); err != nil {
+		return fmt.Errorf("failed to parse config YAML: %v", err)
+	}
+
+	// Merge loaded config with defaults (only override non-zero values)
+	if userConfig.GitHubOwner != "" {
+		cfg.UserConfig.GitHubOwner = userConfig.GitHubOwner
+	}
+	if userConfig.GitHubRepo != "" {
+		cfg.UserConfig.GitHubRepo = userConfig.GitHubRepo
+	}
+	if len(userConfig.GitHubRepos) > 0 {
+		cfg.UserConfig.GitHubRepos = userConfig.GitHubRepos
+	}
+	if userConfig.GitHubLabel != "" {
+		cfg.UserConfig.GitHubLabel = userConfig.GitHubLabel
+	}
+	if userConfig.JiraProjectKey != "" {
+		cfg.UserConfig.JiraProjectKey = userConfig.JiraProjectKey
+	}
+	if userConfig.JiraProjectID != "" {
+		cfg.UserConfig.JiraProjectID = userConfig.JiraProjectID
+	}
+	if userConfig.JiraIssueType != "" {
+		cfg.UserConfig.JiraIssueType = userConfig.JiraIssueType
+	}
+	if userConfig.JiraIssueTypeID != "" {
+		cfg.UserConfig.JiraIssueTypeID = userConfig.JiraIssueTypeID
+	}
+	if userConfig.JiraStatusOpen != "" {
+		cfg.UserConfig.JiraStatusOpen = userConfig.JiraStatusOpen
+	}
+	if userConfig.JiraStatusClosed != "" {
+		cfg.UserConfig.JiraStatusClosed = userConfig.JiraStatusClosed
+	}
+	if userConfig.JiraStatusDraft != "" {
+		cfg.UserConfig.JiraStatusDraft = userConfig.JiraStatusDraft
+	}
+	if userConfig.JiraStatusReopened != "" {
+		cfg.UserConfig.JiraStatusReopened = userConfig.JiraStatusReopened
+	}
+	if userConfig.JiraResolution != "" {
+		cfg.UserConfig.JiraResolution = userConfig.JiraResolution
+	}
+	if len(userConfig.GitHubToJiraUsers) > 0 {
+		cfg.UserConfig.GitHubToJiraUsers = userConfig.GitHubToJiraUsers
+	}
+	if len(userConfig.CyberArkKnownUsers) > 0 {
+		cfg.UserConfig.CyberArkKnownUsers = userConfig.CyberArkKnownUsers
+	}
+	// For booleans, we need to check if they were explicitly set in YAML
+	// This is a limitation of Go YAML parsing - we'll accept any explicit value
+	cfg.UserConfig.JiraSkipDescription = userConfig.JiraSkipDescription
+
+	log.Printf("loaded config: %d user mappings, %d CyberArk users",
+		len(cfg.UserConfig.GitHubToJiraUsers), len(cfg.UserConfig.CyberArkKnownUsers))
+
+	return nil
+}
+
 func listOrgRepos(ctx context.Context, cfg config) ([]string, error) {
 	client := &http.Client{Timeout: cfg.HTTPTimeout}
 	perPage := 100
 	page := 1
 	var repos []string
-	base := fmt.Sprintf("https://api.github.com/orgs/%s/repos", url.PathEscape(cfg.GitHubOwner))
+	base := fmt.Sprintf("https://api.github.com/orgs/%s/repos", url.PathEscape(cfg.UserConfig.GitHubOwner))
 	for {
 		reqURL := fmt.Sprintf("%s?per_page=%d&page=%d", base, perPage, page)
 		req, _ := http.NewRequestWithContext(ctx, http.MethodGet, reqURL, nil)
@@ -408,9 +606,9 @@ func fetchGitHubIssues(ctx context.Context, cfg config, repo string) ([]ghIssue,
 	var all []ghIssue
 	perPage := 100
 	page := 1
-	base := fmt.Sprintf("https://api.github.com/repos/%s/%s/issues", url.PathEscape(cfg.GitHubOwner), url.PathEscape(repo))
+	base := fmt.Sprintf("https://api.github.com/repos/%s/%s/issues", url.PathEscape(cfg.UserConfig.GitHubOwner), url.PathEscape(repo))
 	for {
-		reqURL := fmt.Sprintf("%s?state=all&labels=%s&per_page=%d&page=%d", base, url.QueryEscape(cfg.GitHubLabel), perPage, page)
+		reqURL := fmt.Sprintf("%s?state=all&labels=%s&per_page=%d&page=%d", base, url.QueryEscape(cfg.UserConfig.GitHubLabel), perPage, page)
 		req, _ := http.NewRequestWithContext(ctx, http.MethodGet, reqURL, nil)
 		req.Header.Set("Authorization", "Bearer "+cfg.GitHubToken)
 		req.Header.Set("Accept", "application/vnd.github+json")
@@ -437,7 +635,7 @@ func fetchGitHubIssues(ctx context.Context, cfg config, repo string) ([]ghIssue,
 			if pageItems[i].PullRequest != nil {
 				prDetails, err := fetchGitHubPRDetails(ctx, cfg, repo, pageItems[i].Number)
 				if err != nil {
-					log.Printf("warn: failed to fetch PR details for %s/%s#%d: %v", cfg.GitHubOwner, repo, pageItems[i].Number, err)
+					log.Printf("warn: failed to fetch PR details for %s/%s#%d: %v", cfg.UserConfig.GitHubOwner, repo, pageItems[i].Number, err)
 				} else {
 					pageItems[i].Merged = prDetails.Merged
 					pageItems[i].Draft = prDetails.Draft
@@ -460,7 +658,7 @@ func fetchGitHubIssues(ctx context.Context, cfg config, repo string) ([]ghIssue,
 // fetchGitHubPRDetails fetches additional PR details including merged status
 func fetchGitHubPRDetails(ctx context.Context, cfg config, repo string, prNumber int) (*ghIssue, error) {
 	client := &http.Client{Timeout: cfg.HTTPTimeout}
-	reqURL := fmt.Sprintf("https://api.github.com/repos/%s/%s/pulls/%d", url.PathEscape(cfg.GitHubOwner), url.PathEscape(repo), prNumber)
+	reqURL := fmt.Sprintf("https://api.github.com/repos/%s/%s/pulls/%d", url.PathEscape(cfg.UserConfig.GitHubOwner), url.PathEscape(repo), prNumber)
 	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, reqURL, nil)
 	req.Header.Set("Authorization", "Bearer "+cfg.GitHubToken)
 	req.Header.Set("Accept", "application/vnd.github+json")
@@ -481,6 +679,105 @@ func fetchGitHubPRDetails(ctx context.Context, cfg config, repo string, prNumber
 	return &pr, nil
 }
 
+// fetchGitHubPRReviewers fetches the reviewers for a PR
+func fetchGitHubPRReviewers(ctx context.Context, cfg config, repo string, prNumber int) ([]ghUser, error) {
+	client := &http.Client{Timeout: cfg.HTTPTimeout}
+	reqURL := fmt.Sprintf("https://api.github.com/repos/%s/%s/pulls/%d/requested_reviewers", url.PathEscape(cfg.UserConfig.GitHubOwner), url.PathEscape(repo), prNumber)
+	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, reqURL, nil)
+	req.Header.Set("Authorization", "Bearer "+cfg.GitHubToken)
+	req.Header.Set("Accept", "application/vnd.github+json")
+	req.Header.Set("User-Agent", "gh-to-jira-bot")
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
+		return nil, fmt.Errorf("github PR reviewers: status %d: %s", resp.StatusCode, string(body))
+	}
+	var reviewRequest ghReviewRequest
+	if err := json.NewDecoder(resp.Body).Decode(&reviewRequest); err != nil {
+		return nil, err
+	}
+	return reviewRequest.Users, nil
+}
+
+// determineJiraAssignee determines the best Jira assignee based on GitHub issue/PR data
+func determineJiraAssignee(ctx context.Context, cfg config, repo string, is ghIssue) (string, error) {
+	var candidates []string
+
+	// Create a set of CyberArk known users for quick lookup
+	cyberArkUsers := make(map[string]bool)
+	for _, user := range cfg.UserConfig.CyberArkKnownUsers {
+		cyberArkUsers[user] = true
+	}
+
+	// Start with the author if known at CyberArk
+	if is.User != nil && is.User.Login != "" {
+		if cyberArkUsers[is.User.Login] {
+			candidates = append(candidates, is.User.Login)
+		}
+	}
+
+	// Add assignees if known at CyberArk
+	for _, assignee := range is.Assignees {
+		if assignee.Login != "" && cyberArkUsers[assignee.Login] {
+			candidates = append(candidates, assignee.Login)
+		}
+	}
+
+	// For PRs, also check reviewers
+	if is.PullRequest != nil {
+		reviewers, err := fetchGitHubPRReviewers(ctx, cfg, repo, is.Number)
+		if err != nil {
+			log.Printf("warn: failed to fetch reviewers for %s/%s#%d: %v", cfg.UserConfig.GitHubOwner, repo, is.Number, err)
+		} else {
+			for _, reviewer := range reviewers {
+				if reviewer.Login != "" && cyberArkUsers[reviewer.Login] {
+					candidates = append(candidates, reviewer.Login)
+				}
+			}
+		}
+	}
+
+	// If author is not known at CyberArk, fallback to assignees and reviewers
+	if len(candidates) == 0 {
+		// Add any assignee (even if not known at CyberArk)
+		for _, assignee := range is.Assignees {
+			if assignee.Login != "" {
+				candidates = append(candidates, assignee.Login)
+			}
+		}
+
+		// For PRs, add any reviewer
+		if is.PullRequest != nil {
+			reviewers, err := fetchGitHubPRReviewers(ctx, cfg, repo, is.Number)
+			if err == nil {
+				for _, reviewer := range reviewers {
+					if reviewer.Login != "" {
+						candidates = append(candidates, reviewer.Login)
+					}
+				}
+			}
+		}
+	}
+
+	// Remove duplicates and pick the first candidate
+	seen := make(map[string]bool)
+	for _, candidate := range candidates {
+		if !seen[candidate] {
+			seen[candidate] = true
+			// Check if we have a mapping for this GitHub user
+			if jiraAccountID, exists := cfg.UserConfig.GitHubToJiraUsers[candidate]; exists {
+				return jiraAccountID, nil
+			}
+		}
+	}
+
+	return "", nil // No suitable assignee found
+}
+
 // milestone logic removed
 
 // Jira helper: basic auth header
@@ -491,8 +788,8 @@ func jiraAuthHeader(email, token string) string {
 
 func jiraFindExisting(ctx context.Context, cfg config, repo string, ghNumber int) (string, error) {
 	client := &http.Client{Timeout: cfg.HTTPTimeout}
-	token := escapeJQLString(summaryPrefix(cfg.GitHubOwner, repo, ghNumber))
-	jql := fmt.Sprintf(`project = %s AND environment ~ "%s"`, cfg.JiraProjectKey, token)
+	token := escapeJQLString(summaryPrefix(cfg.UserConfig.GitHubOwner, repo, ghNumber))
+	jql := fmt.Sprintf(`project = %s AND environment ~ "%s"`, cfg.UserConfig.JiraProjectKey, token)
 	reqURL := fmt.Sprintf("%s/rest/api/3/search/jql?jql=%s&maxResults=2&fields=id,key,status", strings.TrimRight(cfg.JiraBaseURL, "/"), url.QueryEscape(jql))
 	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, reqURL, nil)
 	req.Header.Set("Authorization", jiraAuthHeader(cfg.JiraEmail, cfg.JiraAPIToken))
@@ -564,7 +861,7 @@ func jiraCreateFromGitHubIssue(ctx context.Context, cfg config, repo string, is 
 	defer resp.Body.Close()
 	if resp.StatusCode != 201 {
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, 8192))
-		if resp.StatusCode == 400 && !cfg.JiraSkipDescription && payload.Fields["description"] != nil {
+		if resp.StatusCode == 400 && !cfg.UserConfig.JiraSkipDescription && payload.Fields["description"] != nil {
 			// Retry once without description in case ADF or required fields cause INVALID_INPUT
 			payload.Fields["description"] = nil
 			b2, _ := json.Marshal(payload)
@@ -598,8 +895,8 @@ func jiraCreateFromGitHubIssue(ctx context.Context, cfg config, repo string, is 
 
 func jiraFindExistingWithStatus(ctx context.Context, cfg config, repo string, ghNumber int) (*jiraBasicIssue, error) {
 	client := &http.Client{Timeout: cfg.HTTPTimeout}
-	token := escapeJQLString(summaryPrefix(cfg.GitHubOwner, repo, ghNumber))
-	jql := fmt.Sprintf(`project = %s AND environment ~ "%s"`, cfg.JiraProjectKey, token)
+	token := escapeJQLString(summaryPrefix(cfg.UserConfig.GitHubOwner, repo, ghNumber))
+	jql := fmt.Sprintf(`project = %s AND environment ~ "%s"`, cfg.UserConfig.JiraProjectKey, token)
 	reqURL := fmt.Sprintf("%s/rest/api/3/search/jql?jql=%s&maxResults=2&fields=id,key,status", strings.TrimRight(cfg.JiraBaseURL, "/"), url.QueryEscape(jql))
 	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, reqURL, nil)
 	req.Header.Set("Authorization", jiraAuthHeader(cfg.JiraEmail, cfg.JiraAPIToken))
@@ -650,19 +947,28 @@ func jiraFindExistingWithStatus(ctx context.Context, cfg config, repo string, gh
 	return nil, nil
 }
 
-// jiraUpdateFromGitHubIssue updates labels of an existing Jira issue while
+// jiraUpdateFromGitHubIssue updates labels and assignee of an existing Jira issue while
 // leaving summary/description untouched by default.
 func jiraUpdateFromGitHubIssue(ctx context.Context, cfg config, issueKey string, repo string, is ghIssue) error {
 	client := &http.Client{Timeout: cfg.HTTPTimeout}
 
 	// Merge labels with existing to avoid losing data
 	existing, _ := jiraGetIssueLabels(ctx, cfg, issueKey)
-	desired := uniqueStrings(append(existing, []string{"github", "cert-manager", cfg.GitHubLabel, fmt.Sprintf("repo:%s", repo)}...))
+	desired := uniqueStrings(append(existing, []string{"github", "cert-manager", cfg.UserConfig.GitHubLabel, fmt.Sprintf("repo:%s", repo)}...))
 
-	payload := jiraIssueCreateRequest{Fields: map[string]any{
+	fields := map[string]any{
 		"labels":      desired,
-		"environment": buildEnvironmentADF(cfg.GitHubOwner, repo, is.Number, is.HTMLURL),
-	}}
+		"environment": buildEnvironmentADF(cfg.UserConfig.GitHubOwner, repo, is.Number, is.HTMLURL),
+	}
+
+	// Update assignee based on GitHub issue/PR data
+	if assigneeAccountID, err := determineJiraAssignee(ctx, cfg, repo, is); err != nil {
+		log.Printf("warn: failed to determine assignee for %s/%s#%d: %v", cfg.UserConfig.GitHubOwner, repo, is.Number, err)
+	} else if assigneeAccountID != "" {
+		fields["assignee"] = map[string]any{"accountId": assigneeAccountID}
+	}
+
+	payload := jiraIssueCreateRequest{Fields: fields}
 
 	b, _ := json.Marshal(payload)
 	reqURL := fmt.Sprintf("%s/rest/api/3/issue/%s", strings.TrimRight(cfg.JiraBaseURL, "/"), url.PathEscape(issueKey))
@@ -704,15 +1010,15 @@ func jiraUpdateFromGitHubIssueWithStatus(ctx context.Context, cfg config, jiraIs
 	// Handle the "NOT_CLOSED" rule for open GitHub issues/PRs
 	if desiredStatus == "NOT_CLOSED" {
 		// For open GitHub items, we want any status except the closed status
-		if strings.EqualFold(currentStatus, cfg.JiraStatusClosed) {
+		if strings.EqualFold(currentStatus, cfg.UserConfig.JiraStatusClosed) {
 			// Current status is "Done/Closed" but GitHub is open - need to reopen
-			log.Printf("GitHub %s/%s#%d is open but Jira issue %s is %q, attempting to reopen to %q", 
-				cfg.GitHubOwner, repo, is.Number, jiraIssue.Key, currentStatus, cfg.JiraStatusOpen)
-			return jiraTransitionStatus(ctx, cfg, jiraIssue.Key, currentStatus, cfg.JiraStatusOpen)
+			log.Printf("GitHub %s/%s#%d is open but Jira issue %s is %q, attempting to reopen to %q",
+				cfg.UserConfig.GitHubOwner, repo, is.Number, jiraIssue.Key, currentStatus, cfg.UserConfig.JiraStatusReopened)
+			return jiraTransitionStatus(ctx, cfg, jiraIssue.Key, currentStatus, cfg.UserConfig.JiraStatusReopened)
 		} else {
 			// Current status is fine (not closed), leave it as is
-			log.Printf("GitHub %s/%s#%d is open and Jira issue %s is %q (acceptable, not changing)", 
-				cfg.GitHubOwner, repo, is.Number, jiraIssue.Key, currentStatus)
+			log.Printf("GitHub %s/%s#%d is open and Jira issue %s is %q (acceptable, not changing)",
+				cfg.UserConfig.GitHubOwner, repo, is.Number, jiraIssue.Key, currentStatus)
 			return nil
 		}
 	}
@@ -732,8 +1038,8 @@ func jiraUpdateFromGitHubIssueWithStatus(ctx context.Context, cfg config, jiraIs
 			githubState = "draft"
 		}
 	}
-	log.Printf("GitHub %s/%s#%d is %q, attempting to transition Jira issue %s from %q to %q", 
-		cfg.GitHubOwner, repo, is.Number, githubState, jiraIssue.Key, currentStatus, desiredStatus)
+	log.Printf("GitHub %s/%s#%d is %q, attempting to transition Jira issue %s from %q to %q",
+		cfg.UserConfig.GitHubOwner, repo, is.Number, githubState, jiraIssue.Key, currentStatus, desiredStatus)
 
 	// Perform status transition
 	return jiraTransitionStatus(ctx, cfg, jiraIssue.Key, currentStatus, desiredStatus)
@@ -744,13 +1050,13 @@ func getDesiredJiraStatus(cfg config, is ghIssue) string {
 	if is.PullRequest != nil {
 		// This is a PR
 		if is.Merged {
-			return cfg.JiraStatusClosed
+			return cfg.UserConfig.JiraStatusClosed
 		}
 		if is.Draft {
-			return cfg.JiraStatusDraft
+			return cfg.UserConfig.JiraStatusDraft
 		}
 		if is.State == "closed" {
-			return cfg.JiraStatusClosed
+			return cfg.UserConfig.JiraStatusClosed
 		}
 		if is.State == "open" {
 			// For open PRs, any status except closed/done is acceptable
@@ -759,7 +1065,7 @@ func getDesiredJiraStatus(cfg config, is ghIssue) string {
 	} else {
 		// This is an issue
 		if is.State == "closed" {
-			return cfg.JiraStatusClosed
+			return cfg.UserConfig.JiraStatusClosed
 		}
 		if is.State == "open" {
 			// For open issues, any status except closed/done is acceptable
@@ -788,7 +1094,17 @@ func jiraTransitionStatus(ctx context.Context, cfg config, issueKey, currentStat
 
 	if transitionID == "" {
 		// No direct transition available to target status
-		log.Printf("warn: no transition available from %q to %q for %s", currentStatus, targetStatus, issueKey)
+		// Build list of available transition targets
+		var availableTargets []string
+		for _, t := range transitions {
+			availableTargets = append(availableTargets, t.To.Name)
+		}
+
+		if len(availableTargets) > 0 {
+			log.Printf("warn: no transition available from %q to %q for %s, only possible transitions are: %s", currentStatus, targetStatus, issueKey, strings.Join(availableTargets, ", "))
+		} else {
+			log.Printf("warn: no transition available from %q to %q for %s, no transitions available", currentStatus, targetStatus, issueKey)
+		}
 		return nil
 	}
 
@@ -798,6 +1114,15 @@ func jiraTransitionStatus(ctx context.Context, cfg config, issueKey, currentStat
 		Transition: struct {
 			ID string `json:"id"`
 		}{ID: transitionID},
+	}
+
+	// If transitioning to closed status, include resolution field
+	if strings.EqualFold(targetStatus, cfg.UserConfig.JiraStatusClosed) {
+		payload.Fields = map[string]any{
+			"resolution": map[string]any{
+				"name": cfg.UserConfig.JiraResolution,
+			},
+		}
 	}
 
 	b, _ := json.Marshal(payload)
@@ -893,28 +1218,35 @@ func jiraAddRemoteLink(ctx context.Context, cfg config, issueKey, urlStr, title 
 // augmenting with required fields from CreateMeta when possible.
 func buildCreateFieldsMap(ctx context.Context, cfg config, repo string, is ghIssue) (map[string]any, error) {
 	summary := buildSummary(repo, is.Number, is.Title)
-	labels := uniqueStrings([]string{"github", "cert-manager", cfg.GitHubLabel, fmt.Sprintf("repo:%s", repo)})
+	labels := uniqueStrings([]string{"github", "cert-manager", cfg.UserConfig.GitHubLabel, fmt.Sprintf("repo:%s", repo)})
 	fields := map[string]any{
 		"summary": summary,
 		"labels":  labels,
 	}
-	fields["environment"] = buildEnvironmentADF(cfg.GitHubOwner, repo, is.Number, is.HTMLURL)
-	if !cfg.JiraSkipDescription {
-		if desc := buildJiraADFDescription(cfg.GitHubOwner, repo, is); desc != nil {
+	fields["environment"] = buildEnvironmentADF(cfg.UserConfig.GitHubOwner, repo, is.Number, is.HTMLURL)
+	if !cfg.UserConfig.JiraSkipDescription {
+		if desc := buildJiraADFDescription(cfg.UserConfig.GitHubOwner, repo, is); desc != nil {
 			fields["description"] = desc
 		}
 	}
 
-	// Project/issuetype references
-	if cfg.JiraProjectID != "" {
-		fields["project"] = map[string]any{"id": cfg.JiraProjectID}
-	} else {
-		fields["project"] = map[string]any{"key": cfg.JiraProjectKey}
+	// Set assignee based on GitHub issue/PR data
+	if assigneeAccountID, err := determineJiraAssignee(ctx, cfg, repo, is); err != nil {
+		log.Printf("warn: failed to determine assignee for %s/%s#%d: %v", cfg.UserConfig.GitHubOwner, repo, is.Number, err)
+	} else if assigneeAccountID != "" {
+		fields["assignee"] = map[string]any{"accountId": assigneeAccountID}
 	}
-	if cfg.JiraIssueTypeID != "" {
-		fields["issuetype"] = map[string]any{"id": cfg.JiraIssueTypeID}
+
+	// Project/issuetype references
+	if cfg.UserConfig.JiraProjectID != "" {
+		fields["project"] = map[string]any{"id": cfg.UserConfig.JiraProjectID}
 	} else {
-		fields["issuetype"] = map[string]any{"name": cfg.JiraIssueType}
+		fields["project"] = map[string]any{"key": cfg.UserConfig.JiraProjectKey}
+	}
+	if cfg.UserConfig.JiraIssueTypeID != "" {
+		fields["issuetype"] = map[string]any{"id": cfg.UserConfig.JiraIssueTypeID}
+	} else {
+		fields["issuetype"] = map[string]any{"name": cfg.UserConfig.JiraIssueType}
 	}
 
 	// Enhance with required fields from CreateMeta
@@ -931,15 +1263,15 @@ func fetchCreateMetaRequiredFields(ctx context.Context, cfg config) (map[string]
 	client := &http.Client{Timeout: cfg.HTTPTimeout}
 	base := fmt.Sprintf("%s/rest/api/3/issue/createmeta", strings.TrimRight(cfg.JiraBaseURL, "/"))
 	q := url.Values{}
-	if cfg.JiraProjectID != "" {
-		q.Set("projectIds", cfg.JiraProjectID)
-	} else if cfg.JiraProjectKey != "" {
-		q.Set("projectKeys", cfg.JiraProjectKey)
+	if cfg.UserConfig.JiraProjectID != "" {
+		q.Set("projectIds", cfg.UserConfig.JiraProjectID)
+	} else if cfg.UserConfig.JiraProjectKey != "" {
+		q.Set("projectKeys", cfg.UserConfig.JiraProjectKey)
 	}
-	if cfg.JiraIssueTypeID != "" {
-		q.Set("issuetypeIds", cfg.JiraIssueTypeID)
-	} else if cfg.JiraIssueType != "" {
-		q.Set("issuetypeNames", cfg.JiraIssueType)
+	if cfg.UserConfig.JiraIssueTypeID != "" {
+		q.Set("issuetypeIds", cfg.UserConfig.JiraIssueTypeID)
+	} else if cfg.UserConfig.JiraIssueType != "" {
+		q.Set("issuetypeNames", cfg.UserConfig.JiraIssueType)
 	}
 	q.Set("expand", "projects.issuetypes.fields")
 	reqURL := base + "?" + q.Encode()
@@ -961,18 +1293,18 @@ func fetchCreateMetaRequiredFields(ctx context.Context, cfg config) (map[string]
 	}
 	for _, p := range meta.Projects {
 		for _, it := range p.Issuetypes {
-			if (cfg.JiraIssueTypeID != "" && it.ID == cfg.JiraIssueTypeID) || strings.EqualFold(it.Name, cfg.JiraIssueType) || cfg.JiraIssueType == "" {
+			if (cfg.UserConfig.JiraIssueTypeID != "" && it.ID == cfg.UserConfig.JiraIssueTypeID) || strings.EqualFold(it.Name, cfg.UserConfig.JiraIssueType) || cfg.UserConfig.JiraIssueType == "" {
 				return it.Fields, nil
 			}
 		}
 	}
-	return nil, fmt.Errorf("issuetype %q not found in createmeta", cfg.JiraIssueType)
+	return nil, fmt.Errorf("issuetype %q not found in createmeta", cfg.UserConfig.JiraIssueType)
 }
 
 // enhanceFieldsWithMeta adds minimal values for required fields not already present.
 func enhanceFieldsWithMeta(fields map[string]any, meta map[string]jiraFieldMetaInfo) {
 	skip := map[string]struct{}{
-		"summary": {}, "project": {}, "issuetype": {}, "labels": {}, "description": {},
+		"summary": {}, "project": {}, "issuetype": {}, "labels": {}, "description": {}, "assignee": {},
 	}
 	for key, info := range meta {
 		if !info.Required {
