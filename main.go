@@ -1075,6 +1075,33 @@ func getDesiredJiraStatus(cfg config, is ghIssue) string {
 	return ""
 }
 
+// isClosedStatus checks if a status name represents a closed/done state
+func isClosedStatus(status string) bool {
+	s := strings.ToLower(strings.TrimSpace(status))
+	closedStatuses := []string{"done", "closed", "resolved", "complete", "completed", "finished"}
+	for _, closed := range closedStatuses {
+		if s == closed {
+			return true
+		}
+	}
+	return false
+}
+
+// statusNamesMatch checks if two status names should be considered equivalent
+func statusNamesMatch(status1, status2 string) bool {
+	// Direct case-insensitive match
+	if strings.EqualFold(status1, status2) {
+		return true
+	}
+	
+	// If both are closed statuses, consider them equivalent
+	if isClosedStatus(status1) && isClosedStatus(status2) {
+		return true
+	}
+	
+	return false
+}
+
 // jiraTransitionStatus transitions a Jira issue to the specified status
 func jiraTransitionStatus(ctx context.Context, cfg config, issueKey, currentStatus, targetStatus string) error {
 	// Get available transitions
@@ -1085,9 +1112,11 @@ func jiraTransitionStatus(ctx context.Context, cfg config, issueKey, currentStat
 
 	// Find transition to target status
 	var transitionID string
+	var matchedStatusName string
 	for _, t := range transitions {
-		if strings.EqualFold(t.To.Name, targetStatus) {
+		if statusNamesMatch(t.To.Name, targetStatus) {
 			transitionID = t.ID
+			matchedStatusName = t.To.Name
 			break
 		}
 	}
@@ -1117,7 +1146,7 @@ func jiraTransitionStatus(ctx context.Context, cfg config, issueKey, currentStat
 	}
 
 	// If transitioning to closed status, include resolution field
-	if strings.EqualFold(targetStatus, cfg.UserConfig.JiraStatusClosed) {
+	if isClosedStatus(targetStatus) || isClosedStatus(matchedStatusName) {
 		payload.Fields = map[string]any{
 			"resolution": map[string]any{
 				"name": cfg.UserConfig.JiraResolution,
@@ -1137,7 +1166,11 @@ func jiraTransitionStatus(ctx context.Context, cfg config, issueKey, currentStat
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode == 204 {
-		log.Printf("transitioned Jira issue %s from %q to %q", issueKey, currentStatus, targetStatus)
+		if matchedStatusName != "" && !strings.EqualFold(matchedStatusName, targetStatus) {
+			log.Printf("transitioned Jira issue %s from %q to %q (matched as %q)", issueKey, currentStatus, targetStatus, matchedStatusName)
+		} else {
+			log.Printf("transitioned Jira issue %s from %q to %q", issueKey, currentStatus, targetStatus)
+		}
 		return nil
 	}
 	body, _ := io.ReadAll(io.LimitReader(resp.Body, 8192))
