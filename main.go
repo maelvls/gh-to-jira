@@ -1010,7 +1010,7 @@ func jiraUpdateFromGitHubIssueWithStatus(ctx context.Context, cfg config, jiraIs
 	// Handle the "NOT_CLOSED" rule for open GitHub issues/PRs
 	if desiredStatus == "NOT_CLOSED" {
 		// For open GitHub items, we want any status except the closed status
-		if strings.EqualFold(currentStatus, cfg.UserConfig.JiraStatusClosed) {
+		if isClosedStatus(currentStatus) {
 			// Current status is "Done/Closed" but GitHub is open - need to reopen
 			log.Printf("GitHub %s/%s#%d is open but Jira issue %s is %q, attempting to reopen to %q",
 				cfg.UserConfig.GitHubOwner, repo, is.Number, jiraIssue.Key, currentStatus, cfg.UserConfig.JiraStatusReopened)
@@ -1024,7 +1024,7 @@ func jiraUpdateFromGitHubIssueWithStatus(ctx context.Context, cfg config, jiraIs
 	}
 
 	// Handle specific status transitions
-	if currentStatus == desiredStatus {
+	if statusNamesMatch(currentStatus, desiredStatus) {
 		log.Printf("Jira issue %s already in correct status %q", jiraIssue.Key, currentStatus)
 		return nil // Already in correct status
 	}
@@ -1093,12 +1093,12 @@ func statusNamesMatch(status1, status2 string) bool {
 	if strings.EqualFold(status1, status2) {
 		return true
 	}
-	
+
 	// If both are closed statuses, consider them equivalent
 	if isClosedStatus(status1) && isClosedStatus(status2) {
 		return true
 	}
-	
+
 	return false
 }
 
