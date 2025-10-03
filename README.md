@@ -118,7 +118,7 @@ What it does
   - Checks Jira for an existing issue whose *environment* field contains `<owner>/<repo>#<n>` (uses GET `/rest/api/3/search/jql`, falls back to POST batch).
   - If not found, creates a Jira issue:
     - Summary: `<repo>#<n>: <issue title>` (you can edit it later, the prefix helps identify the source)
-    - Labels: `github`, `cert-manager`, `<label>`, `repo:<repo>`
+    - Labels: `github`, `cert-manager`, `gh-to-jira`, `<label>`, `repo:<repo>`
     - Environment: `Ref: <owner>/<repo>#<n> (do not edit this)`
     - Description: ADF document containing only a link back to the GitHub item (omit entirely with `JIRA_SKIP_DESCRIPTION=true`).
     - **Assignee**: Automatically determined based on GitHub issue/PR data (see Assignee Logic below).
@@ -148,7 +148,7 @@ Notes
 
 Mapping details
 - **Summary**: `<repo>#<number>: <GitHub title>` (truncated to fit Jira’s limits). Feel free to tweak the descriptive text after the prefix.
-- **Labels**: Always include `github`, `cert-manager`, the configured GitHub label, and `repo:<repo>`, merged with any existing Jira labels.
+- **Labels**: Always include `github`, `cert-manager`, `gh-to-jira`, the configured GitHub label, and `repo:<repo>`, merged with any existing Jira labels.
 - **Environment**: `Ref: <owner>/<repo>#<number> (do not edit this)` rendered as clickable link back to GitHub – this is how the bot finds the ticket on subsequent runs.
 - **Description**: Single paragraph with a link labelled `GitHub <owner>/<repo>#<number>` pointing to the issue/PR; no body content is copied.
 - **Assignee**: Automatically determined from GitHub issue/PR author, assignees, and reviewers (for PRs), prioritizing CyberArk known users. Requires mapping GitHub usernames to Jira account IDs.

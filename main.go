@@ -954,7 +954,7 @@ func jiraUpdateFromGitHubIssue(ctx context.Context, cfg config, issueKey string,
 
 	// Merge labels with existing to avoid losing data
 	existing, _ := jiraGetIssueLabels(ctx, cfg, issueKey)
-	desired := uniqueStrings(append(existing, []string{"github", "cert-manager", cfg.UserConfig.GitHubLabel, fmt.Sprintf("repo:%s", repo)}...))
+	desired := uniqueStrings(append(existing, []string{"github", "cert-manager", "gh-to-jira", cfg.UserConfig.GitHubLabel, fmt.Sprintf("repo:%s", repo)}...))
 
 	fields := map[string]any{
 		"labels":      desired,
@@ -1251,7 +1251,7 @@ func jiraAddRemoteLink(ctx context.Context, cfg config, issueKey, urlStr, title 
 // augmenting with required fields from CreateMeta when possible.
 func buildCreateFieldsMap(ctx context.Context, cfg config, repo string, is ghIssue) (map[string]any, error) {
 	summary := buildSummary(repo, is.Number, is.Title)
-	labels := uniqueStrings([]string{"github", "cert-manager", cfg.UserConfig.GitHubLabel, fmt.Sprintf("repo:%s", repo)})
+	labels := uniqueStrings([]string{"github", "cert-manager", "gh-to-jira", cfg.UserConfig.GitHubLabel, fmt.Sprintf("repo:%s", repo)})
 	fields := map[string]any{
 		"summary": summary,
 		"labels":  labels,
