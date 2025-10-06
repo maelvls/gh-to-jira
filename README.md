@@ -2,7 +2,7 @@ gh-to-jira: Sync labelled cert-manager issues/PRs to Jira
 
 Overview
 - A small Go bot that creates/updates Jira tickets for GitHub issues and PRs across the `cert-manager` organisation carrying a specific label (default `cybr`), polling every minute.
-- Uses GitHub REST API and Jira Cloud REST API v3 (ADF description, remote link back to GitHub).
+- Uses GitHub REST API and Jira Cloud REST API v3 with remote link back to GitHub.
 - Avoids duplicates by storing a Jira issue property that records the GitHub owner, repo, and issue/PR number.
 
 Prerequisites
@@ -62,7 +62,7 @@ github_label: "cybr"                 # GitHub label to filter issues/PRs
 # =============================================================================
 jira_project_key: "PROJ"             # REQUIRED: Jira project key
 jira_issue_type: "Task"              # Jira issue type for created issues
-jira_skip_description: false         # Set to true to omit description field
+jira_skip_description: true          # Set to false to include a GitHub link in the description field (default: true)
 
 # =============================================================================
 # Jira Status Mapping
@@ -119,8 +119,7 @@ What it does
   - If not found, creates a Jira issue:
     - Summary: `<repo>#<n>: <issue title>` (you can edit it later, the prefix helps identify the source)
     - Labels: `github`, `cert-manager`, `gh-to-jira`, `<label>`, `repo:<repo>`
-    - Environment: `Ref: <owner>/<repo>#<n> (do not edit this)`
-    - Description: ADF document containing only a link back to the GitHub item (omit entirely with `JIRA_SKIP_DESCRIPTION=true`).
+    - Environment: `Ref: <owner>/<repo>#<n> (do not edit this)` – The ticket's title and description can be edited freely after creation.
     - **Assignee**: Automatically determined based on GitHub issue/PR data (see Assignee Logic below).
   - Adds a Jira remote link back to the GitHub issue.
   - If the Jira ticket already exists, updates the label set, assignee, and resets the environment field while leaving the summary/description untouched so you can edit them.
@@ -139,7 +138,7 @@ The bot determines the Jira assignee based on GitHub issue/PR information with t
 The GitHub username must be mapped to a Jira account ID in the `github_to_jira_users` section of the YAML config for the assignment to work.
 
 Notes
-- The description uses Atlassian Document Format (ADF) and now only contains a single link back to the GitHub item.
+- The description field is omitted by default, allowing you to add your own description. Set `jira_skip_description: false` to include a link back to the GitHub item in the description.
 - If your Jira project requires additional fields, the bot fetches CreateMeta and auto-fills minimal valid values when creating.
 - Duplicate detection relies on the environment field containing `<owner>/<repo>#<n>`. The bot rewrites that field each cycle, so leave the “(do not edit this)” marker in place.
 - Jira issue properties could theoretically hold the GitHub identifiers, but making them searchable requires an administrator to configure entity-property indexing. Using the environment field avoids that administrative step.
@@ -149,6 +148,5 @@ Notes
 Mapping details
 - **Summary**: `<repo>#<number>: <GitHub title>` (truncated to fit Jira’s limits). Feel free to tweak the descriptive text after the prefix.
 - **Labels**: Always include `github`, `cert-manager`, `gh-to-jira`, the configured GitHub label, and `repo:<repo>`, merged with any existing Jira labels.
-- **Environment**: `Ref: <owner>/<repo>#<number> (do not edit this)` rendered as clickable link back to GitHub – this is how the bot finds the ticket on subsequent runs.
-- **Description**: Single paragraph with a link labelled `GitHub <owner>/<repo>#<number>` pointing to the issue/PR; no body content is copied.
+- **Environment**: `Ref: <owner>/<repo>#<number> (do not edit this)` rendered as clickable link back to GitHub – this is how the bot finds the ticket on subsequent runs. The ticket's title and description can be edited freely after creation.
 - **Assignee**: Automatically determined from GitHub issue/PR author, assignees, and reviewers (for PRs), prioritizing CyberArk known users. Requires mapping GitHub usernames to Jira account IDs.

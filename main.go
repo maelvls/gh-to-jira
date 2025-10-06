@@ -479,7 +479,7 @@ func loadUserConfig(cfg *config) error {
 		JiraResolution:      "Done",
 		GitHubToJiraUsers:   make(map[string]string),
 		CyberArkKnownUsers:  []string{},
-		JiraSkipDescription: false,
+		JiraSkipDescription: true,
 	}
 
 	// Check if file exists
