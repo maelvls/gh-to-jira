@@ -390,58 +390,6 @@ func loadConfig(dryRun bool) (config, error) {
 		return cfg, fmt.Errorf("failed to load config: %v", err)
 	}
 
-	// Allow environment variables to override YAML settings for backwards compatibility
-	if reposEnv := os.Getenv("GITHUB_REPOS"); reposEnv != "" {
-		parts := strings.Split(reposEnv, ",")
-		cfg.UserConfig.GitHubRepos = nil
-		for _, p := range parts {
-			if trimmed := strings.TrimSpace(p); trimmed != "" {
-				cfg.UserConfig.GitHubRepos = append(cfg.UserConfig.GitHubRepos, trimmed)
-			}
-		}
-	}
-
-	// Environment variable overrides for backwards compatibility
-	if v := os.Getenv("GITHUB_OWNER"); v != "" {
-		cfg.UserConfig.GitHubOwner = v
-	}
-	if v := os.Getenv("GITHUB_REPO"); v != "" {
-		cfg.UserConfig.GitHubRepo = v
-	}
-	if v := os.Getenv("GITHUB_LABEL"); v != "" {
-		cfg.UserConfig.GitHubLabel = v
-	}
-	if v := os.Getenv("JIRA_PROJECT_KEY"); v != "" {
-		cfg.UserConfig.JiraProjectKey = v
-	}
-	if v := os.Getenv("JIRA_PROJECT_ID"); v != "" {
-		cfg.UserConfig.JiraProjectID = v
-	}
-	if v := os.Getenv("JIRA_ISSUE_TYPE"); v != "" {
-		cfg.UserConfig.JiraIssueType = v
-	}
-	if v := os.Getenv("JIRA_ISSUE_TYPE_ID"); v != "" {
-		cfg.UserConfig.JiraIssueTypeID = v
-	}
-	if v := os.Getenv("JIRA_SKIP_DESCRIPTION"); v != "" {
-		cfg.UserConfig.JiraSkipDescription = strings.EqualFold(v, "true")
-	}
-	if v := os.Getenv("JIRA_STATUS_OPEN"); v != "" {
-		cfg.UserConfig.JiraStatusOpen = v
-	}
-	if v := os.Getenv("JIRA_STATUS_CLOSED"); v != "" {
-		cfg.UserConfig.JiraStatusClosed = v
-	}
-	if v := os.Getenv("JIRA_STATUS_DRAFT"); v != "" {
-		cfg.UserConfig.JiraStatusDraft = v
-	}
-	if v := os.Getenv("JIRA_STATUS_REOPENED"); v != "" {
-		cfg.UserConfig.JiraStatusReopened = v
-	}
-	if v := os.Getenv("JIRA_RESOLUTION"); v != "" {
-		cfg.UserConfig.JiraResolution = v
-	}
-
 	// Validate required secret environment variables
 	if cfg.GitHubToken == "" {
 		return cfg, errors.New("missing GITHUB_TOKEN")
@@ -452,7 +400,7 @@ func loadConfig(dryRun bool) (config, error) {
 
 	// Validate required YAML configuration
 	if cfg.UserConfig.JiraProjectKey == "" {
-		return cfg, errors.New("missing jira_project_key in config file or JIRA_PROJECT_KEY environment variable")
+		return cfg, errors.New("missing jira_project_key in config file")
 	}
 
 	return cfg, nil
