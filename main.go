@@ -62,6 +62,10 @@ type UserConfig struct {
 	// Jira resolution (for closing tickets)
 	JiraResolution string `yaml:"jira_resolution"`
 
+	// Jira team field configuration
+	JiraTeamFieldKey string `yaml:"jira_team_field_key"` // e.g., customfield_10211
+	JiraTeamOptionID string `yaml:"jira_team_option_id"` // e.g., 13667
+
 	// User mappings
 	GitHubToJiraUsers  map[string]string `yaml:"github_to_jira_users"`
 	CyberArkKnownUsers []string          `yaml:"cyberark_known_users"`
@@ -215,9 +219,10 @@ type jiraTransitionRequest struct {
 func main() {
 	// Parse command-line flags
 	var dryRun = flag.Bool("dry-run", false, "only print actions without making changes")
+	var configPathFlag = flag.String("config", "", "path to YAML configuration file (overrides CONFIG_PATH env var)")
 	flag.Parse()
 
-	cfg, err := loadConfig(*dryRun)
+	cfg, err := loadConfig(*dryRun, *configPathFlag)
 	if err != nil {
 		log.Fatalf("config error: %v", err)
 	}
@@ -373,14 +378,14 @@ type config struct {
 	HTTPTimeout time.Duration
 }
 
-func loadConfig(dryRun bool) (config, error) {
+func loadConfig(dryRun bool, configPathFlag string) (config, error) {
 	cfg := config{
 		// Only load secrets from environment variables
 		GitHubToken:  os.Getenv("GITHUB_TOKEN"),
 		JiraBaseURL:  os.Getenv("JIRA_BASE_URL"),
 		JiraEmail:    os.Getenv("JIRA_EMAIL"),
 		JiraAPIToken: os.Getenv("JIRA_API_TOKEN"),
-		ConfigPath:   getenvDefault("CONFIG_PATH", "config.yaml"),
+		ConfigPath:   resolveConfigPath(configPathFlag),
 		DryRun:       dryRun,
 		HTTPTimeout:  20 * time.Second,
 	}
@@ -411,6 +416,13 @@ func getenvDefault(k, def string) string {
 		return v
 	}
 	return def
+}
+
+func resolveConfigPath(flagValue string) string {
+	if flagValue != "" {
+		return flagValue
+	}
+	return getenvDefault("CONFIG_PATH", "config.yaml")
 }
 
 // loadUserConfig loads user configuration from a YAML file
@@ -902,11 +914,17 @@ func jiraUpdateFromGitHubIssue(ctx context.Context, cfg config, issueKey string,
 
 	// Merge labels with existing to avoid losing data
 	existing, _ := jiraGetIssueLabels(ctx, cfg, issueKey)
-    desired := uniqueStrings(append(existing, []string{"OpenSource", "gh-to-jira", fmt.Sprintf("repo:%s", repo)}...))
+	desired := uniqueStrings(append(existing, []string{"OpenSource", "gh-to-jira", fmt.Sprintf("repo:%s", repo)}...))
 
 	fields := map[string]any{
 		"labels":      desired,
+		"components":  determineJiraComponents(repo),
 		"environment": buildEnvironmentADF(cfg.UserConfig.GitHubOwner, repo, is.Number, is.HTMLURL),
+	}
+
+	// Ensure team remains set on updates as well, if configured
+	if cfg.UserConfig.JiraTeamFieldKey != "" && cfg.UserConfig.JiraTeamOptionID != "" {
+		fields[cfg.UserConfig.JiraTeamFieldKey] = map[string]any{"id": cfg.UserConfig.JiraTeamOptionID}
 	}
 
 	// Update assignee based on GitHub issue/PR data
@@ -1199,10 +1217,16 @@ func jiraAddRemoteLink(ctx context.Context, cfg config, issueKey, urlStr, title 
 // augmenting with required fields from CreateMeta when possible.
 func buildCreateFieldsMap(ctx context.Context, cfg config, repo string, is ghIssue) (map[string]any, error) {
 	summary := buildSummary(repo, is.Number, is.Title)
-    labels := uniqueStrings([]string{"OpenSource", "gh-to-jira", fmt.Sprintf("repo:%s", repo)})
+	labels := uniqueStrings([]string{"OpenSource", "gh-to-jira", fmt.Sprintf("repo:%s", repo)})
 	fields := map[string]any{
-		"summary": summary,
-		"labels":  labels,
+		"summary":    summary,
+		"labels":     labels,
+		"components": determineJiraComponents(repo),
+	}
+
+	// Set Team via configured custom field/option id when provided
+	if cfg.UserConfig.JiraTeamFieldKey != "" && cfg.UserConfig.JiraTeamOptionID != "" {
+		fields[cfg.UserConfig.JiraTeamFieldKey] = map[string]any{"id": cfg.UserConfig.JiraTeamOptionID}
 	}
 	fields["environment"] = buildEnvironmentADF(cfg.UserConfig.GitHubOwner, repo, is.Number, is.HTMLURL)
 	if !cfg.UserConfig.JiraSkipDescription {
@@ -1237,6 +1261,19 @@ func buildCreateFieldsMap(ctx context.Context, cfg config, repo string, is ghIss
 	}
 	enhanceFieldsWithMeta(fields, reqFields)
 	return fields, nil
+}
+
+func determineJiraComponents(repo string) []map[string]any {
+	componentName := "cert-manager"
+	switch repo {
+	case "approver-policy":
+		componentName = "Approver Policy (OSS)"
+	case "trust-manager":
+		componentName = "Trust Manager (OSS)"
+	case "cert-manager":
+		componentName = "cert-manager"
+	}
+	return []map[string]any{{"name": componentName}}
 }
 
 // fetchCreateMetaRequiredFields fetches required fields for the configured project and issuetype.
@@ -1285,7 +1322,7 @@ func fetchCreateMetaRequiredFields(ctx context.Context, cfg config) (map[string]
 // enhanceFieldsWithMeta adds minimal values for required fields not already present.
 func enhanceFieldsWithMeta(fields map[string]any, meta map[string]jiraFieldMetaInfo) {
 	skip := map[string]struct{}{
-		"summary": {}, "project": {}, "issuetype": {}, "labels": {}, "description": {}, "assignee": {},
+		"summary": {}, "project": {}, "issuetype": {}, "labels": {}, "description": {}, "assignee": {}, "components": {},
 	}
 	for key, info := range meta {
 		if !info.Required {

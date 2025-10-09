@@ -29,6 +29,14 @@ jira_status_reopened: "Reopened"     # Status for reopening closed tickets
 jira_resolution: "Done"              # Resolution to set when closing tickets (common: "Done", "Fixed", "Resolved")
 
 # =============================================================================
+# Jira Team Field
+# =============================================================================
+# Configure the Advanced Roadmaps Team field to be set on issues.
+# Use the custom field key and option id for your "cert-manager" team.
+jira_team_field_key: "customfield_10211"   # e.g., customfield_10211
+jira_team_option_id: "13667"               # e.g., 13667 (cert-manager)
+
+# =============================================================================
 # User Mappings
 # =============================================================================
 # Map GitHub usernames to Jira account IDs
