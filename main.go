@@ -66,6 +66,10 @@ type UserConfig struct {
 	JiraTeamFieldKey string `yaml:"jira_team_field_key"` // e.g., customfield_10211
 	JiraTeamOptionID string `yaml:"jira_team_option_id"` // e.g., 13667
 
+	// Jira components configuration
+	JiraDefaultComponent string            `yaml:"jira_default_component"`
+	JiraComponents       map[string]string `yaml:"jira_components"`
+
 	// User mappings
 	GitHubToJiraUsers  map[string]string `yaml:"github_to_jira_users"`
 	CyberArkKnownUsers []string          `yaml:"cyberark_known_users"`
@@ -918,8 +922,10 @@ func jiraUpdateFromGitHubIssue(ctx context.Context, cfg config, issueKey string,
 
 	fields := map[string]any{
 		"labels":      desired,
-		"components":  determineJiraComponents(repo),
 		"environment": buildEnvironmentADF(cfg.UserConfig.GitHubOwner, repo, is.Number, is.HTMLURL),
+	}
+	if components := determineJiraComponents(cfg.UserConfig, repo); len(components) > 0 {
+		fields["components"] = components
 	}
 
 	// Ensure team remains set on updates as well, if configured
@@ -1219,9 +1225,11 @@ func buildCreateFieldsMap(ctx context.Context, cfg config, repo string, is ghIss
 	summary := buildSummary(repo, is.Number, is.Title)
 	labels := uniqueStrings([]string{"OpenSource", "gh-to-jira", fmt.Sprintf("repo:%s", repo)})
 	fields := map[string]any{
-		"summary":    summary,
-		"labels":     labels,
-		"components": determineJiraComponents(repo),
+		"summary": summary,
+		"labels":  labels,
+	}
+	if components := determineJiraComponents(cfg.UserConfig, repo); len(components) > 0 {
+		fields["components"] = components
 	}
 
 	// Set Team via configured custom field/option id when provided
@@ -1263,14 +1271,14 @@ func buildCreateFieldsMap(ctx context.Context, cfg config, repo string, is ghIss
 	return fields, nil
 }
 
-func determineJiraComponents(repo string) []map[string]any {
-	componentName := "cert-manager"
-	switch repo {
-	case "approver-policy":
-		componentName = "Approver Policy (OSS)"
-	case "trust-manager":
-		componentName = "Trust Manager (OSS)"
-	case "cert-manager":
+func determineJiraComponents(userCfg UserConfig, repo string) []map[string]any {
+	componentName := strings.TrimSpace(userCfg.JiraDefaultComponent)
+	if userCfg.JiraComponents != nil {
+		if mapped := strings.TrimSpace(userCfg.JiraComponents[repo]); mapped != "" {
+			componentName = mapped
+		}
+	}
+	if componentName == "" {
 		componentName = "cert-manager"
 	}
 	return []map[string]any{{"name": componentName}}

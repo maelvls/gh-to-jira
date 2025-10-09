@@ -37,6 +37,16 @@ jira_team_field_key: "customfield_10211"   # e.g., customfield_10211
 jira_team_option_id: "13667"               # e.g., 13667 (cert-manager)
 
 # =============================================================================
+# Jira Components
+# =============================================================================
+# Map GitHub repositories to Jira components. The default component is used when no match is found.
+jira_default_component: "cert-manager"
+jira_components:
+  cert-manager: "cert-manager"
+  approver-policy: "Approver Policy (OSS)"
+  trust-manager: "Trust Manager (OSS)"
+
+# =============================================================================
 # User Mappings
 # =============================================================================
 # Map GitHub usernames to Jira account IDs

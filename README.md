@@ -49,6 +49,17 @@ jira_project_key: "PROJ"      # Required
 jira_issue_type: "Task"
 jira_skip_description: true   # Set false to add GitHub link in description
 
+# Jira Team Field (optional)
+jira_team_field_key: "customfield_10211"
+jira_team_option_id: "13667"
+
+# Jira Components
+jira_default_component: "cert-manager"
+jira_components:
+  cert-manager: "cert-manager"
+  approver-policy: "Approver Policy (OSS)"
+  trust-manager: "Trust Manager (OSS)"
+
 # Status Mapping
 jira_status_open: "To Do"
 jira_status_closed: "Done"
