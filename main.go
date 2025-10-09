@@ -669,6 +669,20 @@ func fetchGitHubPRReviewers(ctx context.Context, cfg config, repo string, prNumb
 
 // determineJiraAssignee determines the best Jira assignee based on GitHub issue/PR data
 func determineJiraAssignee(ctx context.Context, cfg config, repo string, is ghIssue) (string, error) {
+	// Do not assign Jira issues when the GitHub issue itself has no assignee.
+	if is.PullRequest == nil {
+		hasGitHubAssignee := false
+		if is.Assignee != nil && is.Assignee.Login != "" {
+			hasGitHubAssignee = true
+		}
+		if len(is.Assignees) > 0 {
+			hasGitHubAssignee = true
+		}
+		if !hasGitHubAssignee {
+			return "", nil
+		}
+	}
+
 	var candidates []string
 
 	// Create a set of CyberArk known users for quick lookup
