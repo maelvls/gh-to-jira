@@ -20,8 +20,18 @@ import (
 	"github.com/go-yaml/yaml"
 )
 
+const (
+	jiraCapacityCategoryField = "customfield_10412"
+	githubJiraBacklinkMarker  = "<!-- do not edit this line, will be re-added automatically -->"
+)
+
 // GitHub models (trimmed)
 type ghLabel struct {
+	Name string `json:"name"`
+}
+
+type ghIssueType struct {
+	ID   int    `json:"id"`
 	Name string `json:"name"`
 }
 
@@ -76,18 +86,19 @@ type UserConfig struct {
 }
 
 type ghIssue struct {
-	Number      int       `json:"number"`
-	Title       string    `json:"title"`
-	Body        string    `json:"body"`
-	HTMLURL     string    `json:"html_url"`
-	Labels      []ghLabel `json:"labels"`
-	PullRequest *struct{} `json:"pull_request,omitempty"`
-	State       string    `json:"state"`
-	Draft       bool      `json:"draft,omitempty"`
-	Merged      bool      `json:"merged,omitempty"`
-	User        *ghUser   `json:"user,omitempty"`      // Author
-	Assignee    *ghUser   `json:"assignee,omitempty"`  // Single assignee
-	Assignees   []ghUser  `json:"assignees,omitempty"` // Multiple assignees
+	Number      int          `json:"number"`
+	Title       string       `json:"title"`
+	Body        string       `json:"body"`
+	HTMLURL     string       `json:"html_url"`
+	Labels      []ghLabel    `json:"labels"`
+	PullRequest *struct{}    `json:"pull_request,omitempty"`
+	State       string       `json:"state"`
+	Draft       bool         `json:"draft,omitempty"`
+	Merged      bool         `json:"merged,omitempty"`
+	IssueType   *ghIssueType `json:"issue_type,omitempty"`
+	User        *ghUser      `json:"user,omitempty"`      // Author
+	Assignee    *ghUser      `json:"assignee,omitempty"`  // Single assignee
+	Assignees   []ghUser     `json:"assignees,omitempty"` // Multiple assignees
 }
 
 // Milestones removed; selection is driven by GitHub labels
@@ -321,6 +332,9 @@ func runCycle(ctx context.Context, cfg config) {
 				if err := jiraUpdateFromGitHubIssueWithStatus(ctx, cfg, existingIssue, repo, is); err != nil {
 					log.Printf("error: updating Jira %s for %s/%s#%d failed: %v", existingIssue.Key, cfg.UserConfig.GitHubOwner, repo, is.Number, err)
 				} else {
+					if err := ensureGitHubJiraBacklink(ctx, cfg, repo, is, existingIssue.Key); err != nil {
+						log.Printf("warn: %v", err)
+					}
 					log.Printf("updated Jira issue %s for %s/%s#%d", existingIssue.Key, cfg.UserConfig.GitHubOwner, repo, is.Number)
 				}
 				continue
@@ -347,6 +361,9 @@ func runCycle(ctx context.Context, cfg config) {
 
 			if err := jiraAddRemoteLink(ctx, cfg, key, is.HTMLURL, is.Title); err != nil {
 				log.Printf("warn: adding remote link to %s failed for %s/%s#%d: %v", key, cfg.UserConfig.GitHubOwner, repo, is.Number, err)
+			}
+			if err := ensureGitHubJiraBacklink(ctx, cfg, repo, is, key); err != nil {
+				log.Printf("warn: %v", err)
 			}
 		}
 	}
@@ -667,6 +684,112 @@ func fetchGitHubPRReviewers(ctx context.Context, cfg config, repo string, prNumb
 	return reviewRequest.Users, nil
 }
 
+func ensureGitHubJiraBacklink(ctx context.Context, cfg config, repo string, is ghIssue, jiraKey string) error {
+	current, err := githubGetIssue(ctx, cfg, repo, is.Number)
+	if err != nil {
+		return fmt.Errorf("fetching GitHub issue %s/%s#%d failed: %w", cfg.UserConfig.GitHubOwner, repo, is.Number, err)
+	}
+	targetLine := buildJiraBacklinkLine(cfg, jiraKey)
+	if strings.Contains(current.Body, targetLine) {
+		return nil
+	}
+	updatedBody, changed := ensureBacklinkLine(current.Body, targetLine)
+	if !changed {
+		return nil
+	}
+	if err := githubUpdateIssueBody(ctx, cfg, repo, is.Number, updatedBody); err != nil {
+		return fmt.Errorf("updating body for %s/%s#%d failed: %w", cfg.UserConfig.GitHubOwner, repo, is.Number, err)
+	}
+	log.Printf("added Jira backlink to description of %s/%s#%d", cfg.UserConfig.GitHubOwner, repo, is.Number)
+	return nil
+}
+
+func githubGetIssue(ctx context.Context, cfg config, repo string, issueNumber int) (*ghIssue, error) {
+	client := &http.Client{Timeout: cfg.HTTPTimeout}
+	reqURL := fmt.Sprintf("https://api.github.com/repos/%s/%s/issues/%d",
+		url.PathEscape(cfg.UserConfig.GitHubOwner), url.PathEscape(repo), issueNumber)
+	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, reqURL, nil)
+	req.Header.Set("Authorization", "Bearer "+cfg.GitHubToken)
+	req.Header.Set("Accept", "application/vnd.github+json")
+	req.Header.Set("User-Agent", "gh-to-jira-bot")
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
+		return nil, fmt.Errorf("github issue get status %d: %s", resp.StatusCode, string(body))
+	}
+	var issue ghIssue
+	if err := json.NewDecoder(resp.Body).Decode(&issue); err != nil {
+		return nil, err
+	}
+	return &issue, nil
+}
+
+func githubUpdateIssueBody(ctx context.Context, cfg config, repo string, issueNumber int, body string) error {
+	client := &http.Client{Timeout: cfg.HTTPTimeout}
+	payload := map[string]string{"body": body}
+	b, _ := json.Marshal(payload)
+	reqURL := fmt.Sprintf("https://api.github.com/repos/%s/%s/issues/%d",
+		url.PathEscape(cfg.UserConfig.GitHubOwner), url.PathEscape(repo), issueNumber)
+	req, _ := http.NewRequestWithContext(ctx, http.MethodPatch, reqURL, strings.NewReader(string(b)))
+	req.Header.Set("Authorization", "Bearer "+cfg.GitHubToken)
+	req.Header.Set("Accept", "application/vnd.github+json")
+	req.Header.Set("User-Agent", "gh-to-jira-bot")
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		respBody, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		return fmt.Errorf("github update body status %d: %s", resp.StatusCode, string(respBody))
+	}
+	return nil
+}
+
+func ensureBacklinkLine(body, line string) (string, bool) {
+	if strings.Contains(body, line) {
+		return body, false
+	}
+	clean := removeBacklinkLine(body)
+	trimmed := strings.TrimRight(clean, "\n")
+	var updated string
+	if strings.TrimSpace(trimmed) == "" {
+		updated = line
+	} else {
+		updated = trimmed + "\n\n" + line
+	}
+	return updated, updated != body
+}
+
+func removeBacklinkLine(body string) string {
+	if !strings.Contains(body, githubJiraBacklinkMarker) {
+		return body
+	}
+	lines := strings.Split(body, "\n")
+	var keep []string
+	for _, line := range lines {
+		if strings.Contains(line, githubJiraBacklinkMarker) {
+			continue
+		}
+		keep = append(keep, line)
+	}
+	return strings.Join(keep, "\n")
+}
+
+func buildJiraBacklinkLine(cfg config, jiraKey string) string {
+	targetURL := buildJiraBrowseURL(cfg, jiraKey)
+	return fmt.Sprintf("CyberArk tracker: [%s](%s) %s", jiraKey, targetURL, githubJiraBacklinkMarker)
+}
+
+func buildJiraBrowseURL(cfg config, jiraKey string) string {
+	return fmt.Sprintf("%s/browse/%s", strings.TrimRight(cfg.JiraBaseURL, "/"), url.PathEscape(jiraKey))
+}
+
 // determineJiraAssignee determines the best Jira assignee based on GitHub issue/PR data
 func determineJiraAssignee(ctx context.Context, cfg config, repo string, is ghIssue) (string, error) {
 	// Do not assign Jira issues when the GitHub issue itself has no assignee.
@@ -945,6 +1068,9 @@ func jiraUpdateFromGitHubIssue(ctx context.Context, cfg config, issueKey string,
 	// Ensure team remains set on updates as well, if configured
 	if cfg.UserConfig.JiraTeamFieldKey != "" && cfg.UserConfig.JiraTeamOptionID != "" {
 		fields[cfg.UserConfig.JiraTeamFieldKey] = map[string]any{"id": cfg.UserConfig.JiraTeamOptionID}
+	}
+	if capacityCategory := determineCapacityCategory(is); capacityCategory != "" {
+		fields[jiraCapacityCategoryField] = map[string]any{"value": capacityCategory}
 	}
 
 	// Update assignee based on GitHub issue/PR data
@@ -1250,6 +1376,9 @@ func buildCreateFieldsMap(ctx context.Context, cfg config, repo string, is ghIss
 	if cfg.UserConfig.JiraTeamFieldKey != "" && cfg.UserConfig.JiraTeamOptionID != "" {
 		fields[cfg.UserConfig.JiraTeamFieldKey] = map[string]any{"id": cfg.UserConfig.JiraTeamOptionID}
 	}
+	if capacityCategory := determineCapacityCategory(is); capacityCategory != "" {
+		fields[jiraCapacityCategoryField] = map[string]any{"value": capacityCategory}
+	}
 	fields["environment"] = buildEnvironmentADF(cfg.UserConfig.GitHubOwner, repo, is.Number, is.HTMLURL)
 	if !cfg.UserConfig.JiraSkipDescription {
 		if desc := buildJiraADFDescription(cfg.UserConfig.GitHubOwner, repo, is); desc != nil {
@@ -1296,6 +1425,33 @@ func determineJiraComponents(userCfg UserConfig, repo string) []map[string]any {
 		componentName = "cert-manager"
 	}
 	return []map[string]any{{"name": componentName}}
+}
+
+var capacityCategoryByIssueTypeID = map[int]string{
+	7830850: "Maintenance", // Task
+	7830853: "Maintenance", // Bug
+	7830856: "Feature",     // Feature
+}
+
+var capacityCategoryByIssueTypeName = map[string]string{
+	"task":    "Maintenance",
+	"bug":     "Maintenance",
+	"feature": "Feature",
+}
+
+func determineCapacityCategory(is ghIssue) string {
+	if is.IssueType == nil {
+		return ""
+	}
+	if val, ok := capacityCategoryByIssueTypeID[is.IssueType.ID]; ok {
+		return val
+	}
+	if name := strings.ToLower(strings.TrimSpace(is.IssueType.Name)); name != "" {
+		if val, ok := capacityCategoryByIssueTypeName[name]; ok {
+			return val
+		}
+	}
+	return ""
 }
 
 // fetchCreateMetaRequiredFields fetches required fields for the configured project and issuetype.
@@ -1346,6 +1502,7 @@ func enhanceFieldsWithMeta(fields map[string]any, meta map[string]jiraFieldMetaI
 	skip := map[string]struct{}{
 		"summary": {}, "project": {}, "issuetype": {}, "labels": {}, "description": {}, "assignee": {}, "components": {},
 	}
+	skip[jiraCapacityCategoryField] = struct{}{}
 	for key, info := range meta {
 		if !info.Required {
 			continue
