@@ -76,6 +76,11 @@ cyberark_known_users:
 - Syncs status: open → non-closed, closed/merged → closed, draft → in-progress
 - Updates labels/assignee each sync; leaves summary/description editable
 
+**Labels applied to Jira**
+- `OpenSource`
+- `gh-to-jira`
+- `repo:<repo-name>`
+
 ## Notes
 
 - Don't edit the environment field marker `(do not edit this)` - used for duplicate detection
