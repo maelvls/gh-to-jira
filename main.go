@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/base64"
+	"encoding/json/jsontext"
 	"encoding/json/v2"
 	"errors"
 	"flag"
@@ -271,7 +272,10 @@ var targetSprintCache struct {
 	ok bool
 }
 
-var errSprintNotFound = errors.New("target sprint not found")
+var (
+	errSprintNotFound      = errors.New("target sprint not found")
+	errBoardWithoutSprints = errors.New("board has no sprints")
+)
 
 func main() {
 	// Parse command-line flags
@@ -696,7 +700,7 @@ func fetchGitHubPRDetails(ctx context.Context, cfg config, repo string, prNumber
 		return nil, fmt.Errorf("github PR details: status %d: %s", resp.StatusCode, string(body))
 	}
 	var pr ghIssue
-	if err := json.NewDecoder(resp.Body).Decode(&pr); err != nil {
+	if err := json.UnmarshalRead(resp.Body, &pr); err != nil {
 		return nil, err
 	}
 	return &pr, nil
@@ -720,7 +724,7 @@ func fetchGitHubPRReviewers(ctx context.Context, cfg config, repo string, prNumb
 		return nil, fmt.Errorf("github PR reviewers: status %d: %s", resp.StatusCode, string(body))
 	}
 	var reviewRequest ghReviewRequest
-	if err := json.NewDecoder(resp.Body).Decode(&reviewRequest); err != nil {
+	if err := json.UnmarshalRead(resp.Body, &reviewRequest); err != nil {
 		return nil, err
 	}
 	return reviewRequest.Users, nil
@@ -767,7 +771,7 @@ func githubGetIssue(ctx context.Context, cfg config, repo string, issueNumber in
 		return nil, fmt.Errorf("github issue get status %d: %s", resp.StatusCode, string(body))
 	}
 	var issue ghIssue
-	if err := json.NewDecoder(resp.Body).Decode(&issue); err != nil {
+	if err := json.UnmarshalRead(resp.Body, &issue); err != nil {
 		return nil, err
 	}
 	return &issue, nil
@@ -949,7 +953,7 @@ func jiraFindExisting(ctx context.Context, cfg config, repo string, ghNumber int
 		defer resp.Body.Close()
 		if resp.StatusCode == 200 {
 			var out jiraSearchResponse
-			if err := json.NewDecoder(resp.Body).Decode(&out); err == nil {
+			if err := json.UnmarshalRead(resp.Body, &out); err == nil {
 				if len(out.Issues) > 0 {
 					return out.Issues[0].Key, nil
 				}
@@ -981,7 +985,7 @@ func jiraFindExisting(ctx context.Context, cfg config, repo string, ghNumber int
 		return "", fmt.Errorf("jira search status %d: %s", resp.StatusCode, string(bdy))
 	}
 	var out jiraJQLBatchResponse
-	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+	if err := json.UnmarshalRead(resp.Body, &out); err != nil {
 		return "", err
 	}
 	if len(out.Results) > 0 && len(out.Results[0].Issues) > 0 {
@@ -1026,7 +1030,7 @@ func jiraCreateFromGitHubIssue(ctx context.Context, cfg config, repo string, is 
 			defer resp2.Body.Close()
 			if resp2.StatusCode == 201 {
 				var out jiraCreateResponse
-				if err := json.NewDecoder(resp2.Body).Decode(&out); err != nil {
+				if err := json.UnmarshalRead(resp2.Body, &out); err != nil {
 					return "", err
 				}
 				return out.Key, nil
@@ -1037,7 +1041,7 @@ func jiraCreateFromGitHubIssue(ctx context.Context, cfg config, repo string, is 
 		return "", fmt.Errorf("jira create status %d: %s", resp.StatusCode, string(body))
 	}
 	var out jiraCreateResponse
-	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+	if err := json.UnmarshalRead(resp.Body, &out); err != nil {
 		return "", err
 	}
 	return out.Key, nil
@@ -1056,7 +1060,7 @@ func jiraFindExistingWithStatus(ctx context.Context, cfg config, repo string, gh
 		defer resp.Body.Close()
 		if resp.StatusCode == 200 {
 			var out jiraSearchResponse
-			if err := json.NewDecoder(resp.Body).Decode(&out); err == nil {
+			if err := json.UnmarshalRead(resp.Body, &out); err == nil {
 				if len(out.Issues) > 0 {
 					return &out.Issues[0], nil
 				}
@@ -1088,7 +1092,7 @@ func jiraFindExistingWithStatus(ctx context.Context, cfg config, repo string, gh
 		return nil, fmt.Errorf("jira search status %d: %s", resp.StatusCode, string(bdy))
 	}
 	var out jiraJQLBatchResponse
-	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+	if err := json.UnmarshalRead(resp.Body, &out); err != nil {
 		return nil, err
 	}
 	if len(out.Results) > 0 && len(out.Results[0].Issues) > 0 {
@@ -1361,7 +1365,7 @@ func jiraGetTransitions(ctx context.Context, cfg config, issueKey string) ([]jir
 		return nil, fmt.Errorf("jira get transitions status %d: %s", resp.StatusCode, string(body))
 	}
 	var out jiraTransitionsResponse
-	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+	if err := json.UnmarshalRead(resp.Body, &out); err != nil {
 		return nil, err
 	}
 	return out.Transitions, nil
@@ -1385,11 +1389,11 @@ func jiraGetIssueSyncFields(ctx context.Context, cfg config, issueKey string) (j
 	}
 	var out struct {
 		Fields struct {
-			Labels  []string        `json:"labels"`
-			Sprints json.RawMessage `json:"customfield_10020"`
+			Labels  []string       `json:"labels"`
+			Sprints jsontext.Value `json:"customfield_10020"`
 		} `json:"fields"`
 	}
-	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+	if err := json.UnmarshalRead(resp.Body, &out); err != nil {
 		return jiraIssueSyncFields{}, err
 	}
 	return jiraIssueSyncFields{
@@ -1398,20 +1402,20 @@ func jiraGetIssueSyncFields(ctx context.Context, cfg config, issueKey string) (j
 	}, nil
 }
 
-func parseSprintField(raw json.RawMessage) []jiraSprint {
+func parseSprintField(raw jsontext.Value) []jiraSprint {
 	if len(raw) == 0 {
 		return nil
 	}
 	var sprints []jiraSprint
-	if err := json.Unmarshal(raw, &sprints); err == nil {
+	if err := json.Unmarshal([]byte(raw), &sprints); err == nil {
 		return sprints
 	}
 	var single jiraSprint
-	if err := json.Unmarshal(raw, &single); err == nil {
+	if err := json.Unmarshal([]byte(raw), &single); err == nil {
 		return []jiraSprint{single}
 	}
 	var names []string
-	if err := json.Unmarshal(raw, &names); err == nil {
+	if err := json.Unmarshal([]byte(raw), &names); err == nil {
 		for _, name := range names {
 			if trimmed := strings.TrimSpace(name); trimmed != "" {
 				sprints = append(sprints, jiraSprint{Name: trimmed})
@@ -1490,7 +1494,7 @@ func fetchTargetSprintID(ctx context.Context, cfg config) (int, error) {
 		if err == nil {
 			return id, nil
 		}
-		if errors.Is(err, errSprintNotFound) {
+		if errors.Is(err, errSprintNotFound) || errors.Is(err, errBoardWithoutSprints) {
 			continue
 		}
 		return 0, err
@@ -1525,7 +1529,7 @@ func jiraListBoardsForProject(ctx context.Context, cfg config) ([]jiraBoard, err
 			return nil, fmt.Errorf("jira board list status %d: %s", resp.StatusCode, string(b))
 		}
 		var out jiraBoardListResponse
-		if decodeErr := json.NewDecoder(resp.Body).Decode(&out); decodeErr != nil {
+		if decodeErr := json.UnmarshalRead(resp.Body, &out); decodeErr != nil {
 			resp.Body.Close()
 			return nil, decodeErr
 		}
@@ -1555,10 +1559,13 @@ func jiraFindSprintOnBoard(ctx context.Context, cfg config, boardID int, targetN
 		if resp.StatusCode != 200 {
 			b, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
 			resp.Body.Close()
+			if resp.StatusCode == 400 && boardHasNoSprints(b) {
+				return 0, errBoardWithoutSprints
+			}
 			return 0, fmt.Errorf("jira sprint list status %d board %d: %s", resp.StatusCode, boardID, string(b))
 		}
 		var out jiraSprintListResponse
-		if decodeErr := json.NewDecoder(resp.Body).Decode(&out); decodeErr != nil {
+		if decodeErr := json.UnmarshalRead(resp.Body, &out); decodeErr != nil {
 			resp.Body.Close()
 			return 0, decodeErr
 		}
@@ -1574,6 +1581,22 @@ func jiraFindSprintOnBoard(ctx context.Context, cfg config, boardID int, targetN
 		startAt += len(out.Values)
 	}
 	return 0, errSprintNotFound
+}
+
+func boardHasNoSprints(body []byte) bool {
+	type jiraError struct {
+		ErrorMessages []string `json:"errorMessages"`
+	}
+	var payload jiraError
+	if err := json.Unmarshal(body, &payload); err != nil {
+		return false
+	}
+	for _, msg := range payload.ErrorMessages {
+		if strings.Contains(strings.ToLower(msg), "does not support sprints") {
+			return true
+		}
+	}
+	return false
 }
 
 func jiraAddIssuesToSprint(ctx context.Context, cfg config, sprintID int, issueKeys []string) error {
@@ -1749,7 +1772,7 @@ func fetchCreateMetaRequiredFields(ctx context.Context, cfg config) (map[string]
 		return nil, fmt.Errorf("createmeta status %d: %s", resp.StatusCode, string(b))
 	}
 	var meta jiraCreateMetaResponse
-	if err := json.NewDecoder(resp.Body).Decode(&meta); err != nil {
+	if err := json.UnmarshalRead(resp.Body, &meta); err != nil {
 		return nil, err
 	}
 	for _, p := range meta.Projects {
