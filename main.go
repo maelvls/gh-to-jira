@@ -14,6 +14,7 @@ import (
 	"os"
 	"os/signal"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -22,6 +23,8 @@ import (
 
 const (
 	jiraCapacityCategoryField = "customfield_10412"
+	jiraSprintFieldKey        = "customfield_10020"
+	jiraTargetSprintName      = "cert-manager - OpenSource"
 	githubJiraBacklinkMarker  = "<!-- do not edit this line, will be re-added automatically -->"
 )
 
@@ -231,6 +234,45 @@ type jiraTransitionRequest struct {
 	Fields map[string]any `json:"fields,omitzero"`
 }
 
+type jiraSprint struct {
+	ID    int    `json:"id"`
+	Name  string `json:"name"`
+	State string `json:"state,omitzero"`
+}
+
+type jiraBoard struct {
+	ID   int    `json:"id"`
+	Name string `json:"name"`
+	Type string `json:"type,omitzero"`
+}
+
+type jiraBoardListResponse struct {
+	Values     []jiraBoard `json:"values"`
+	IsLast     bool        `json:"isLast"`
+	StartAt    int         `json:"startAt,omitzero"`
+	MaxResults int         `json:"maxResults,omitzero"`
+}
+
+type jiraSprintListResponse struct {
+	Values     []jiraSprint `json:"values"`
+	IsLast     bool         `json:"isLast"`
+	StartAt    int          `json:"startAt,omitzero"`
+	MaxResults int          `json:"maxResults,omitzero"`
+}
+
+type jiraIssueSyncFields struct {
+	Labels  []string
+	Sprints []jiraSprint
+}
+
+var targetSprintCache struct {
+	mu sync.Mutex
+	id int
+	ok bool
+}
+
+var errSprintNotFound = errors.New("target sprint not found")
+
 func main() {
 	// Parse command-line flags
 	var dryRun = flag.Bool("dry-run", false, "only print actions without making changes")
@@ -355,6 +397,9 @@ func runCycle(ctx context.Context, cfg config) {
 				continue
 			}
 			log.Printf("created Jira issue %s for %s/%s#%d", key, cfg.UserConfig.GitHubOwner, repo, is.Number)
+			if err := ensureIssueInTargetSprint(ctx, cfg, key, nil); err != nil {
+				log.Printf("warn: assigning sprint to %s failed: %v", key, err)
+			}
 
 			if err := jiraAddRemoteLink(ctx, cfg, key, is.HTMLURL, is.Title); err != nil {
 				log.Printf("warn: adding remote link to %s failed for %s/%s#%d: %v", key, cfg.UserConfig.GitHubOwner, repo, is.Number, err)
@@ -1058,8 +1103,12 @@ func jiraUpdateFromGitHubIssue(ctx context.Context, cfg config, issueKey string,
 	client := &http.Client{Timeout: cfg.HTTPTimeout}
 
 	// Merge labels with existing to avoid losing data
-	existing, _ := jiraGetIssueLabels(ctx, cfg, issueKey)
-	desired := uniqueStrings(append(existing, []string{"OpenSource", "gh-to-jira", fmt.Sprintf("repo:%s", repo)}...))
+	snapshot, err := jiraGetIssueSyncFields(ctx, cfg, issueKey)
+	if err != nil {
+		log.Printf("warn: failed to load labels and sprint for %s: %v", issueKey, err)
+	}
+	desired := uniqueStrings(append(snapshot.Labels, []string{"OpenSource", "gh-to-jira", fmt.Sprintf("repo:%s", repo)}...))
+	assignSprint := jiraTargetSprintName != "" && !issueHasSprint(snapshot.Sprints, jiraTargetSprintName)
 
 	fields := map[string]any{
 		"labels":      desired,
@@ -1098,6 +1147,11 @@ func jiraUpdateFromGitHubIssue(ctx context.Context, cfg config, issueKey string,
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode == 204 {
+		if assignSprint {
+			if err := ensureIssueInTargetSprint(ctx, cfg, issueKey, snapshot.Sprints); err != nil {
+				return err
+			}
+		}
 		return nil
 	}
 	body, _ := io.ReadAll(io.LimitReader(resp.Body, 8192))
@@ -1313,30 +1367,240 @@ func jiraGetTransitions(ctx context.Context, cfg config, issueKey string) ([]jir
 	return out.Transitions, nil
 }
 
-func jiraGetIssueLabels(ctx context.Context, cfg config, issueKey string) ([]string, error) {
+func jiraGetIssueSyncFields(ctx context.Context, cfg config, issueKey string) (jiraIssueSyncFields, error) {
 	client := &http.Client{Timeout: cfg.HTTPTimeout}
-	reqURL := fmt.Sprintf("%s/rest/api/3/issue/%s?fields=labels", strings.TrimRight(cfg.JiraBaseURL, "/"), url.PathEscape(issueKey))
+	fieldsParam := fmt.Sprintf("labels,%s", jiraSprintFieldKey)
+	reqURL := fmt.Sprintf("%s/rest/api/3/issue/%s?fields=%s", strings.TrimRight(cfg.JiraBaseURL, "/"), url.PathEscape(issueKey), url.QueryEscape(fieldsParam))
 	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, reqURL, nil)
 	req.Header.Set("Authorization", jiraAuthHeader(cfg.JiraEmail, cfg.JiraAPIToken))
 	req.Header.Set("Accept", "application/json")
 	resp, err := client.Do(req)
 	if err != nil {
-		return nil, err
+		return jiraIssueSyncFields{}, err
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != 200 {
 		b, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
-		return nil, fmt.Errorf("jira get issue labels status %d: %s", resp.StatusCode, string(b))
+		return jiraIssueSyncFields{}, fmt.Errorf("jira get issue sync fields status %d: %s", resp.StatusCode, string(b))
 	}
 	var out struct {
 		Fields struct {
-			Labels []string `json:"labels"`
+			Labels  []string        `json:"labels"`
+			Sprints json.RawMessage `json:"customfield_10020"`
 		} `json:"fields"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
-		return nil, err
+		return jiraIssueSyncFields{}, err
 	}
-	return out.Fields.Labels, nil
+	return jiraIssueSyncFields{
+		Labels:  out.Fields.Labels,
+		Sprints: parseSprintField(out.Fields.Sprints),
+	}, nil
+}
+
+func parseSprintField(raw json.RawMessage) []jiraSprint {
+	if len(raw) == 0 {
+		return nil
+	}
+	var sprints []jiraSprint
+	if err := json.Unmarshal(raw, &sprints); err == nil {
+		return sprints
+	}
+	var single jiraSprint
+	if err := json.Unmarshal(raw, &single); err == nil {
+		return []jiraSprint{single}
+	}
+	var names []string
+	if err := json.Unmarshal(raw, &names); err == nil {
+		for _, name := range names {
+			if trimmed := strings.TrimSpace(name); trimmed != "" {
+				sprints = append(sprints, jiraSprint{Name: trimmed})
+			}
+		}
+		return sprints
+	}
+	var name string
+	if err := json.Unmarshal(raw, &name); err == nil {
+		if trimmed := strings.TrimSpace(name); trimmed != "" {
+			return []jiraSprint{{Name: trimmed}}
+		}
+	}
+	return nil
+}
+
+func issueHasSprint(sprints []jiraSprint, targetName string) bool {
+	if targetName == "" {
+		return false
+	}
+	for _, sprint := range sprints {
+		if strings.EqualFold(strings.TrimSpace(sprint.Name), targetName) {
+			return true
+		}
+	}
+	return false
+}
+
+func ensureIssueInTargetSprint(ctx context.Context, cfg config, issueKey string, currentSprints []jiraSprint) error {
+	if jiraTargetSprintName == "" {
+		return nil
+	}
+	if issueHasSprint(currentSprints, jiraTargetSprintName) {
+		return nil
+	}
+	sprintID, err := resolveTargetSprintID(ctx, cfg)
+	if err != nil {
+		return fmt.Errorf("resolve sprint: %w", err)
+	}
+	if err := jiraAddIssuesToSprint(ctx, cfg, sprintID, []string{issueKey}); err != nil {
+		return fmt.Errorf("assign issue %s to sprint %d: %w", issueKey, sprintID, err)
+	}
+	return nil
+}
+
+func resolveTargetSprintID(ctx context.Context, cfg config) (int, error) {
+	targetSprintCache.mu.Lock()
+	if targetSprintCache.ok {
+		id := targetSprintCache.id
+		targetSprintCache.mu.Unlock()
+		return id, nil
+	}
+	targetSprintCache.mu.Unlock()
+
+	id, err := fetchTargetSprintID(ctx, cfg)
+	if err != nil {
+		return 0, err
+	}
+	targetSprintCache.mu.Lock()
+	targetSprintCache.id = id
+	targetSprintCache.ok = true
+	targetSprintCache.mu.Unlock()
+	return id, nil
+}
+
+func fetchTargetSprintID(ctx context.Context, cfg config) (int, error) {
+	boards, err := jiraListBoardsForProject(ctx, cfg)
+	if err != nil {
+		return 0, err
+	}
+	if len(boards) == 0 {
+		return 0, fmt.Errorf("no agile boards found for project")
+	}
+	for _, board := range boards {
+		id, err := jiraFindSprintOnBoard(ctx, cfg, board.ID, jiraTargetSprintName)
+		if err == nil {
+			return id, nil
+		}
+		if errors.Is(err, errSprintNotFound) {
+			continue
+		}
+		return 0, err
+	}
+	return 0, fmt.Errorf("sprint %q not found on any board", jiraTargetSprintName)
+}
+
+func jiraListBoardsForProject(ctx context.Context, cfg config) ([]jiraBoard, error) {
+	keyOrID := strings.TrimSpace(cfg.UserConfig.JiraProjectID)
+	if keyOrID == "" {
+		keyOrID = strings.TrimSpace(cfg.UserConfig.JiraProjectKey)
+	}
+	if keyOrID == "" {
+		return nil, fmt.Errorf("missing Jira project key or id for board lookup")
+	}
+	client := &http.Client{Timeout: cfg.HTTPTimeout}
+	base := strings.TrimRight(cfg.JiraBaseURL, "/")
+	startAt := 0
+	var boards []jiraBoard
+	for {
+		reqURL := fmt.Sprintf("%s/rest/agile/1.0/board?projectKeyOrId=%s&startAt=%d&maxResults=50", base, url.QueryEscape(keyOrID), startAt)
+		req, _ := http.NewRequestWithContext(ctx, http.MethodGet, reqURL, nil)
+		req.Header.Set("Authorization", jiraAuthHeader(cfg.JiraEmail, cfg.JiraAPIToken))
+		req.Header.Set("Accept", "application/json")
+		resp, err := client.Do(req)
+		if err != nil {
+			return nil, err
+		}
+		if resp.StatusCode != 200 {
+			b, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+			resp.Body.Close()
+			return nil, fmt.Errorf("jira board list status %d: %s", resp.StatusCode, string(b))
+		}
+		var out jiraBoardListResponse
+		if decodeErr := json.NewDecoder(resp.Body).Decode(&out); decodeErr != nil {
+			resp.Body.Close()
+			return nil, decodeErr
+		}
+		resp.Body.Close()
+		boards = append(boards, out.Values...)
+		if out.IsLast || len(out.Values) == 0 {
+			break
+		}
+		startAt += len(out.Values)
+	}
+	return boards, nil
+}
+
+func jiraFindSprintOnBoard(ctx context.Context, cfg config, boardID int, targetName string) (int, error) {
+	client := &http.Client{Timeout: cfg.HTTPTimeout}
+	base := strings.TrimRight(cfg.JiraBaseURL, "/")
+	startAt := 0
+	for {
+		reqURL := fmt.Sprintf("%s/rest/agile/1.0/board/%d/sprint?state=active,future,closed&startAt=%d&maxResults=50", base, boardID, startAt)
+		req, _ := http.NewRequestWithContext(ctx, http.MethodGet, reqURL, nil)
+		req.Header.Set("Authorization", jiraAuthHeader(cfg.JiraEmail, cfg.JiraAPIToken))
+		req.Header.Set("Accept", "application/json")
+		resp, err := client.Do(req)
+		if err != nil {
+			return 0, err
+		}
+		if resp.StatusCode != 200 {
+			b, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+			resp.Body.Close()
+			return 0, fmt.Errorf("jira sprint list status %d board %d: %s", resp.StatusCode, boardID, string(b))
+		}
+		var out jiraSprintListResponse
+		if decodeErr := json.NewDecoder(resp.Body).Decode(&out); decodeErr != nil {
+			resp.Body.Close()
+			return 0, decodeErr
+		}
+		resp.Body.Close()
+		for _, sprint := range out.Values {
+			if strings.EqualFold(strings.TrimSpace(sprint.Name), targetName) {
+				return sprint.ID, nil
+			}
+		}
+		if out.IsLast || len(out.Values) == 0 {
+			break
+		}
+		startAt += len(out.Values)
+	}
+	return 0, errSprintNotFound
+}
+
+func jiraAddIssuesToSprint(ctx context.Context, cfg config, sprintID int, issueKeys []string) error {
+	if sprintID <= 0 {
+		return fmt.Errorf("invalid sprint id %d", sprintID)
+	}
+	if len(issueKeys) == 0 {
+		return nil
+	}
+	client := &http.Client{Timeout: cfg.HTTPTimeout}
+	payload := map[string]any{"issues": issueKeys}
+	body, _ := json.Marshal(payload)
+	reqURL := fmt.Sprintf("%s/rest/agile/1.0/sprint/%d/issue", strings.TrimRight(cfg.JiraBaseURL, "/"), sprintID)
+	req, _ := http.NewRequestWithContext(ctx, http.MethodPost, reqURL, strings.NewReader(string(body)))
+	req.Header.Set("Authorization", jiraAuthHeader(cfg.JiraEmail, cfg.JiraAPIToken))
+	req.Header.Set("Accept", "application/json")
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode == 204 {
+		return nil
+	}
+	b, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+	return fmt.Errorf("jira sprint assignment status %d: %s", resp.StatusCode, string(b))
 }
 
 func jiraAddRemoteLink(ctx context.Context, cfg config, issueKey, urlStr, title string) error {
@@ -1504,6 +1768,7 @@ func enhanceFieldsWithMeta(fields map[string]any, meta map[string]jiraFieldMetaI
 		"summary": {}, "project": {}, "issuetype": {}, "labels": {}, "description": {}, "assignee": {}, "components": {},
 	}
 	skip[jiraCapacityCategoryField] = struct{}{}
+	skip[jiraSprintFieldKey] = struct{}{}
 	for key, info := range meta {
 		if !info.Required {
 			continue
