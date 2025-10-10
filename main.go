@@ -41,11 +41,11 @@ type ghUser struct {
 }
 
 type ghReviewer struct {
-	User *ghUser `json:"user,omitempty"`
+	User ghUser `json:"user,omitzero"`
 }
 
 type ghReviewRequest struct {
-	Users []ghUser `json:"users,omitempty"`
+	Users []ghUser `json:"users,omitzero"`
 }
 
 // UserConfig represents the YAML configuration for user mappings and application settings
@@ -86,19 +86,19 @@ type UserConfig struct {
 }
 
 type ghIssue struct {
-	Number      int          `json:"number"`
-	Title       string       `json:"title"`
-	Body        string       `json:"body"`
-	HTMLURL     string       `json:"html_url"`
-	Labels      []ghLabel    `json:"labels"`
-	PullRequest *struct{}    `json:"pull_request,omitempty"`
-	State       string       `json:"state"`
-	Draft       bool         `json:"draft,omitempty"`
-	Merged      bool         `json:"merged,omitempty"`
-	IssueType   *ghIssueType `json:"issue_type,omitempty"`
-	User        *ghUser      `json:"user,omitempty"`      // Author
-	Assignee    *ghUser      `json:"assignee,omitempty"`  // Single assignee
-	Assignees   []ghUser     `json:"assignees,omitempty"` // Multiple assignees
+	Number      int         `json:"number"`
+	Title       string      `json:"title"`
+	Body        string      `json:"body"`
+	HTMLURL     string      `json:"html_url"`
+	Labels      []ghLabel   `json:"labels"`
+	PullRequest *struct{}   `json:"pull_request,omitzero"`
+	State       string      `json:"state"`
+	Draft       bool        `json:"draft,omitzero"`
+	Merged      bool        `json:"merged,omitzero"`
+	IssueType   ghIssueType `json:"issue_type,omitzero"`
+	User        ghUser      `json:"user,omitzero"`      // Author
+	Assignee    ghUser      `json:"assignee,omitzero"`  // Single assignee
+	Assignees   []ghUser    `json:"assignees,omitzero"` // Multiple assignees
 }
 
 // Milestones removed; selection is driven by GitHub labels
@@ -109,13 +109,13 @@ type jiraIssueCreateRequest struct {
 }
 
 type jiraProjectRef struct {
-	ID  string `json:"id,omitempty"`
-	Key string `json:"key,omitempty"`
+	ID  string `json:"id,omitzero"`
+	Key string `json:"key,omitzero"`
 }
 
 type jiraIssueTypeRef struct {
-	ID   string `json:"id,omitempty"`
-	Name string `json:"name,omitempty"`
+	ID   string `json:"id,omitzero"`
+	Name string `json:"name,omitzero"`
 }
 
 // CreateMeta types (trimmed)
@@ -141,8 +141,8 @@ type jiraFieldMetaInfo struct {
 
 type jiraFieldSchema struct {
 	Type   string `json:"type"`
-	Items  string `json:"items,omitempty"`
-	Custom string `json:"custom,omitempty"`
+	Items  string `json:"items,omitzero"`
+	Custom string `json:"custom,omitzero"`
 }
 
 // ADF (very minimal)
@@ -154,15 +154,15 @@ type jiraADFDoc struct {
 
 type jiraADFNode struct {
 	Type    string         `json:"type"`
-	Content []jiraADFNode  `json:"content,omitempty"`
-	Text    string         `json:"text,omitempty"`
-	Marks   []jiraADFMark  `json:"marks,omitempty"`
-	Attrs   map[string]any `json:"attrs,omitempty"`
+	Content []jiraADFNode  `json:"content,omitzero"`
+	Text    string         `json:"text,omitzero"`
+	Marks   []jiraADFMark  `json:"marks,omitzero"`
+	Attrs   map[string]any `json:"attrs,omitzero"`
 }
 
 type jiraADFMark struct {
 	Type  string         `json:"type"`
-	Attrs map[string]any `json:"attrs,omitempty"`
+	Attrs map[string]any `json:"attrs,omitzero"`
 }
 
 type jiraCreateResponse struct {
@@ -178,12 +178,12 @@ type jiraSearchResponse struct {
 type jiraBasicIssue struct {
 	ID     string `json:"id"`
 	Key    string `json:"key"`
-	Fields *struct {
-		Status *struct {
+	Fields struct {
+		Status struct {
 			ID   string `json:"id"`
 			Name string `json:"name"`
-		} `json:"status,omitempty"`
-	} `json:"fields,omitempty"`
+		} `json:"status,omitzero"`
+	} `json:"fields,omitzero"`
 }
 
 type jiraJQLBatchRequest struct {
@@ -192,9 +192,9 @@ type jiraJQLBatchRequest struct {
 
 type jiraJQLQuery struct {
 	JQL        string   `json:"jql"`
-	StartAt    int      `json:"startAt,omitempty"`
-	MaxResults int      `json:"maxResults,omitempty"`
-	Fields     []string `json:"fields,omitempty"`
+	StartAt    int      `json:"startAt,omitzero"`
+	MaxResults int      `json:"maxResults,omitzero"`
+	Fields     []string `json:"fields,omitzero"`
 }
 
 type jiraJQLBatchResponse struct {
@@ -228,7 +228,7 @@ type jiraTransitionRequest struct {
 	Transition struct {
 		ID string `json:"id"`
 	} `json:"transition"`
-	Fields map[string]any `json:"fields,omitempty"`
+	Fields map[string]any `json:"fields,omitzero"`
 }
 
 func main() {
@@ -299,10 +299,7 @@ func runCycle(ctx context.Context, cfg config) {
 			if existingIssue != nil {
 				if cfg.DryRun {
 					desiredStatus := getDesiredJiraStatus(cfg, is)
-					currentStatus := ""
-					if existingIssue.Fields != nil && existingIssue.Fields.Status != nil {
-						currentStatus = existingIssue.Fields.Status.Name
-					}
+					currentStatus := existingIssue.Fields.Status.Name
 					statusMsg := ""
 					if desiredStatus != "" {
 						if desiredStatus == "NOT_CLOSED" {
@@ -691,12 +688,15 @@ func ensureGitHubJiraBacklink(ctx context.Context, cfg config, repo string, is g
 	}
 	targetLine := buildJiraBacklinkLine(cfg, jiraKey)
 	if strings.Contains(current.Body, targetLine) {
+		log.Printf("backlink already present on %s/%s#%d, skipping update", cfg.UserConfig.GitHubOwner, repo, is.Number)
 		return nil
 	}
 	updatedBody, changed := ensureBacklinkLine(current.Body, targetLine)
 	if !changed {
+		log.Printf("backlink unchanged after normalisation on %s/%s#%d, skipping update", cfg.UserConfig.GitHubOwner, repo, is.Number)
 		return nil
 	}
+	log.Printf("updating GitHub description for %s/%s#%d with Jira backlink", cfg.UserConfig.GitHubOwner, repo, is.Number)
 	if err := githubUpdateIssueBody(ctx, cfg, repo, is.Number, updatedBody); err != nil {
 		return fmt.Errorf("updating body for %s/%s#%d failed: %w", cfg.UserConfig.GitHubOwner, repo, is.Number, err)
 	}
@@ -790,12 +790,16 @@ func buildJiraBrowseURL(cfg config, jiraKey string) string {
 	return fmt.Sprintf("%s/browse/%s", strings.TrimRight(cfg.JiraBaseURL, "/"), url.PathEscape(jiraKey))
 }
 
+func isAnIssue(is ghIssue) bool {
+	return is.PullRequest == nil
+}
+
 // determineJiraAssignee determines the best Jira assignee based on GitHub issue/PR data
 func determineJiraAssignee(ctx context.Context, cfg config, repo string, is ghIssue) (string, error) {
 	// Do not assign Jira issues when the GitHub issue itself has no assignee.
-	if is.PullRequest == nil {
+	if isAnIssue(is) {
 		hasGitHubAssignee := false
-		if is.Assignee != nil && is.Assignee.Login != "" {
+		if is.Assignee.Login != "" {
 			hasGitHubAssignee = true
 		}
 		if len(is.Assignees) > 0 {
@@ -808,27 +812,27 @@ func determineJiraAssignee(ctx context.Context, cfg config, repo string, is ghIs
 
 	var candidates []string
 
-	// Create a set of CyberArk known users for quick lookup
+	// Create a set of CyberArk known users for quick lookup.
 	cyberArkUsers := make(map[string]bool)
 	for _, user := range cfg.UserConfig.CyberArkKnownUsers {
 		cyberArkUsers[user] = true
 	}
 
-	// Start with the author if known at CyberArk
-	if is.User != nil && is.User.Login != "" {
+	// Start with the author if known at CyberArk.
+	if is.User.Login != "" {
 		if cyberArkUsers[is.User.Login] {
 			candidates = append(candidates, is.User.Login)
 		}
 	}
 
-	// Add assignees if known at CyberArk
+	// Add assignees if known at CyberArk.
 	for _, assignee := range is.Assignees {
 		if assignee.Login != "" && cyberArkUsers[assignee.Login] {
 			candidates = append(candidates, assignee.Login)
 		}
 	}
 
-	// For PRs, also check reviewers
+	// For PRs, also check reviewers.
 	if is.PullRequest != nil {
 		reviewers, err := fetchGitHubPRReviewers(ctx, cfg, repo, is.Number)
 		if err != nil {
@@ -842,9 +846,9 @@ func determineJiraAssignee(ctx context.Context, cfg config, repo string, is ghIs
 		}
 	}
 
-	// If author is not known at CyberArk, fallback to assignees and reviewers
+	// If author is not known at CyberArk, fallback to assignees and reviewers.
 	if len(candidates) == 0 {
-		// Add any assignee (even if not known at CyberArk)
+		// Add any assignee (even if not known at CyberArk).
 		for _, assignee := range is.Assignees {
 			if assignee.Login != "" {
 				candidates = append(candidates, assignee.Login)
@@ -1114,10 +1118,7 @@ func jiraUpdateFromGitHubIssueWithStatus(ctx context.Context, cfg config, jiraIs
 	}
 
 	// Get current status
-	currentStatus := ""
-	if jiraIssue.Fields != nil && jiraIssue.Fields.Status != nil {
-		currentStatus = jiraIssue.Fields.Status.Name
-	}
+	currentStatus := jiraIssue.Fields.Status.Name
 
 	// Handle the "NOT_CLOSED" rule for open GitHub issues/PRs
 	if desiredStatus == "NOT_CLOSED" {
@@ -1440,7 +1441,7 @@ var capacityCategoryByIssueTypeName = map[string]string{
 }
 
 func determineCapacityCategory(is ghIssue) string {
-	if is.IssueType == nil {
+	if is.IssueType == (ghIssueType{}) {
 		return ""
 	}
 	if val, ok := capacityCategoryByIssueTypeID[is.IssueType.ID]; ok {
