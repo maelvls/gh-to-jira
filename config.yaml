@@ -11,6 +11,11 @@ github_repos: []                     # List of specific repositories to monitor 
 github_label: "cybr"                 # GitHub label to filter issues/PRs
 
 # =============================================================================
+# Runtime Settings.
+# =============================================================================
+sync_period: "5m"                    # Runtime sync interval.
+
+# =============================================================================
 # Jira Project Configuration  
 # =============================================================================
 jira_project_key: ""                 # REQUIRED: Jira project key (e.g., "PROJ")

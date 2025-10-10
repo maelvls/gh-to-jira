@@ -59,6 +59,7 @@ type UserConfig struct {
 	GitHubRepo  string   `yaml:"github_repo"`
 	GitHubRepos []string `yaml:"github_repos"`
 	GitHubLabel string   `yaml:"github_label"`
+	SyncPeriod  string   `yaml:"sync_period"`
 
 	// Jira project configuration
 	JiraProjectKey      string `yaml:"jira_project_key"`
@@ -291,7 +292,7 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	ticker := time.NewTicker(time.Minute)
+	ticker := time.NewTicker(cfg.SyncPeriod)
 	defer ticker.Stop()
 
 	runCycle(ctx, cfg)
@@ -447,6 +448,7 @@ type config struct {
 	DryRun bool
 
 	HTTPTimeout time.Duration
+	SyncPeriod  time.Duration
 }
 
 func loadConfig(dryRun bool, configPathFlag string) (config, error) {
@@ -459,6 +461,7 @@ func loadConfig(dryRun bool, configPathFlag string) (config, error) {
 		ConfigPath:   resolveConfigPath(configPathFlag),
 		DryRun:       dryRun,
 		HTTPTimeout:  20 * time.Second,
+		SyncPeriod:   time.Minute,
 	}
 
 	// Load user configuration from YAML file (includes all non-secret config)
@@ -576,6 +579,16 @@ func loadUserConfig(cfg *config) error {
 	}
 	if len(userConfig.CyberArkKnownUsers) > 0 {
 		cfg.UserConfig.CyberArkKnownUsers = userConfig.CyberArkKnownUsers
+	}
+	if userConfig.SyncPeriod != "" {
+		period, err := time.ParseDuration(userConfig.SyncPeriod)
+		if err != nil {
+			return fmt.Errorf("invalid sync_period %q: %v", userConfig.SyncPeriod, err)
+		}
+		if period <= 0 {
+			return fmt.Errorf("invalid sync_period %q: must be greater than zero", userConfig.SyncPeriod)
+		}
+		cfg.SyncPeriod = period
 	}
 	// For booleans, we need to check if they were explicitly set in YAML
 	// This is a limitation of Go YAML parsing - we'll accept any explicit value
