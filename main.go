@@ -362,8 +362,10 @@ func runCycle(ctx context.Context, cfg config) {
 						}
 					}
 					assigneeInfo := ""
-					if assigneeAccountID, err := determineJiraAssignee(ctx, cfg, repo, is); err != nil {
+					if assigneeAccountID, clearAssignee, err := determineJiraAssignee(ctx, cfg, repo, is); err != nil {
 						assigneeInfo = " (assignee determination failed)"
+					} else if clearAssignee {
+						assigneeInfo = " (would clear assignee)"
 					} else if assigneeAccountID != "" {
 						assigneeInfo = fmt.Sprintf(" (would assign to: %s)", assigneeAccountID)
 					} else {
@@ -385,8 +387,10 @@ func runCycle(ctx context.Context, cfg config) {
 
 			if cfg.DryRun {
 				assigneeInfo := ""
-				if assigneeAccountID, err := determineJiraAssignee(ctx, cfg, repo, is); err != nil {
+				if assigneeAccountID, clearAssignee, err := determineJiraAssignee(ctx, cfg, repo, is); err != nil {
 					assigneeInfo = " (assignee determination failed)"
+				} else if clearAssignee {
+					assigneeInfo = " (would clear assignee)"
 				} else if assigneeAccountID != "" {
 					assigneeInfo = fmt.Sprintf(" (would assign to: %s)", assigneeAccountID)
 				} else {
@@ -843,8 +847,9 @@ func isAnIssue(is ghIssue) bool {
 	return is.PullRequest == nil
 }
 
-// determineJiraAssignee determines the best Jira assignee based on GitHub issue/PR data
-func determineJiraAssignee(ctx context.Context, cfg config, repo string, is ghIssue) (string, error) {
+// determineJiraAssignee determines the best Jira assignee based on GitHub issue/PR data.
+// Returns a Jira account ID, a flag indicating whether Jira should be explicitly unassigned, and an error.
+func determineJiraAssignee(ctx context.Context, cfg config, repo string, is ghIssue) (string, bool, error) {
 	// Do not assign Jira issues when the GitHub issue itself has no assignee.
 	if isAnIssue(is) {
 		hasGitHubAssignee := false
@@ -855,7 +860,7 @@ func determineJiraAssignee(ctx context.Context, cfg config, repo string, is ghIs
 			hasGitHubAssignee = true
 		}
 		if !hasGitHubAssignee {
-			return "", nil
+			return "", true, nil
 		}
 	}
 
@@ -924,12 +929,12 @@ func determineJiraAssignee(ctx context.Context, cfg config, repo string, is ghIs
 			seen[candidate] = true
 			// Check if we have a mapping for this GitHub user
 			if jiraAccountID, exists := cfg.UserConfig.GitHubToJiraUsers[candidate]; exists {
-				return jiraAccountID, nil
+				return jiraAccountID, false, nil
 			}
 		}
 	}
 
-	return "", nil // No suitable assignee found
+	return "", false, nil // No suitable assignee found.
 }
 
 // milestone logic removed
@@ -1131,8 +1136,10 @@ func jiraUpdateFromGitHubIssue(ctx context.Context, cfg config, issueKey string,
 	}
 
 	// Update assignee based on GitHub issue/PR data
-	if assigneeAccountID, err := determineJiraAssignee(ctx, cfg, repo, is); err != nil {
+	if assigneeAccountID, clearAssignee, err := determineJiraAssignee(ctx, cfg, repo, is); err != nil {
 		log.Printf("warn: failed to determine assignee for %s/%s#%d: %v", cfg.UserConfig.GitHubOwner, repo, is.Number, err)
+	} else if clearAssignee {
+		fields["assignee"] = nil
 	} else if assigneeAccountID != "" {
 		fields["assignee"] = map[string]any{"accountId": assigneeAccountID}
 	}
@@ -1675,8 +1682,10 @@ func buildCreateFieldsMap(ctx context.Context, cfg config, repo string, is ghIss
 	}
 
 	// Set assignee based on GitHub issue/PR data
-	if assigneeAccountID, err := determineJiraAssignee(ctx, cfg, repo, is); err != nil {
+	if assigneeAccountID, clearAssignee, err := determineJiraAssignee(ctx, cfg, repo, is); err != nil {
 		log.Printf("warn: failed to determine assignee for %s/%s#%d: %v", cfg.UserConfig.GitHubOwner, repo, is.Number, err)
+	} else if clearAssignee {
+		fields["assignee"] = nil
 	} else if assigneeAccountID != "" {
 		fields["assignee"] = map[string]any{"accountId": assigneeAccountID}
 	}
