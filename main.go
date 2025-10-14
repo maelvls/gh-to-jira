@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/base64"
 	"encoding/json/jsontext"
@@ -18,6 +19,8 @@ import (
 	"sync"
 	"syscall"
 	"time"
+
+	"sort"
 
 	"github.com/go-yaml/yaml"
 )
@@ -262,9 +265,24 @@ type jiraSprintListResponse struct {
 	MaxResults int          `json:"maxResults,omitzero"`
 }
 
+type jiraComponent struct {
+	ID   string `json:"id,omitzero"`
+	Name string `json:"name,omitzero"`
+}
+
+type jiraUserRef struct {
+	AccountID   string `json:"accountId,omitzero"`
+	DisplayName string `json:"displayName,omitzero"`
+}
+
 type jiraIssueSyncFields struct {
-	Labels  []string
-	Sprints []jiraSprint
+	Labels              []string
+	Sprints             []jiraSprint
+	Environment         *jiraADFDoc
+	Components          []jiraComponent
+	TeamOptionID        string
+	AssigneeAccountID   string
+	AssigneeDisplayName string
 }
 
 var targetSprintCache struct {
@@ -1208,39 +1226,137 @@ func jiraFindExistingWithStatusByEnvironment(ctx context.Context, cfg config, re
 // jiraUpdateFromGitHubIssue updates labels and assignee of an existing Jira issue while
 // leaving summary/description untouched by default.
 func jiraUpdateFromGitHubIssue(ctx context.Context, cfg config, issueKey string, repo string, is ghIssue) error {
+	repoRef := fmt.Sprintf("%s/%s#%d", cfg.UserConfig.GitHubOwner, repo, is.Number)
 	client := &http.Client{Timeout: cfg.HTTPTimeout}
 
-	// Merge labels with existing to avoid losing data
+	// Merge labels with existing to avoid losing data.
 	snapshot, err := jiraGetIssueSyncFields(ctx, cfg, issueKey)
 	if err != nil {
 		log.Printf("warn: failed to load labels and sprint for %s: %v", issueKey, err)
 	}
 	desired := uniqueStrings(append(snapshot.Labels, []string{"OpenSource", "gh-to-jira", fmt.Sprintf("repo:%s", repo)}...))
+	envDoc := buildEnvironmentADF(cfg.UserConfig.GitHubOwner, repo, is.Number, is.HTMLURL)
+	components := determineJiraComponents(cfg.UserConfig, repo)
 	// We no longer force sprint updates here so Jira users can control the field after creation.
-	fields := map[string]any{
+	fieldPayload := map[string]any{
 		"labels":      desired,
-		"environment": buildEnvironmentADF(cfg.UserConfig.GitHubOwner, repo, is.Number, is.HTMLURL),
+		"environment": envDoc,
 	}
-	if components := determineJiraComponents(cfg.UserConfig, repo); len(components) > 0 {
-		fields["components"] = components
+	if len(components) > 0 {
+		fieldPayload["components"] = components
 	}
 
 	// Ensure team remains set on updates as well, if configured.
-	if cfg.UserConfig.JiraTeamFieldKey != "" && cfg.UserConfig.JiraTeamOptionID != "" {
-		fields[cfg.UserConfig.JiraTeamFieldKey] = map[string]any{"id": cfg.UserConfig.JiraTeamOptionID}
+	teamFieldKey := strings.TrimSpace(cfg.UserConfig.JiraTeamFieldKey)
+	teamOptionID := strings.TrimSpace(cfg.UserConfig.JiraTeamOptionID)
+	if teamFieldKey != "" && teamOptionID != "" {
+		fieldPayload[teamFieldKey] = map[string]any{"id": teamOptionID}
 	}
 	// Capacity category remains untouched during updates so teams can adjust it in Jira.
 
-	// Update assignee based on GitHub issue/PR data
-	if assigneeAccountID, clearAssignee, err := determineJiraAssignee(ctx, cfg, repo, is); err != nil {
-		log.Printf("warn: failed to determine assignee for %s/%s#%d: %v", cfg.UserConfig.GitHubOwner, repo, is.Number, err)
-	} else if clearAssignee {
-		fields["assignee"] = nil
-	} else if assigneeAccountID != "" {
-		fields["assignee"] = map[string]any{"accountId": assigneeAccountID}
+	var (
+		newAssigneeAccountID string
+		shouldClearAssignee  bool
+		assignDecisionMade   bool
+	)
+
+	// Update assignee based on GitHub issue/PR data.
+	if assigneeAccountID, clearAssignee, determineErr := determineJiraAssignee(ctx, cfg, repo, is); determineErr != nil {
+		log.Printf("warn: failed to determine assignee for %s/%s#%d: %v", cfg.UserConfig.GitHubOwner, repo, is.Number, determineErr)
+	} else {
+		newAssigneeAccountID = strings.TrimSpace(assigneeAccountID)
+		shouldClearAssignee = clearAssignee
+		assignDecisionMade = shouldClearAssignee || newAssigneeAccountID != ""
+		if shouldClearAssignee {
+			fieldPayload["assignee"] = nil
+		} else if newAssigneeAccountID != "" {
+			fieldPayload["assignee"] = map[string]any{"accountId": newAssigneeAccountID}
+		}
 	}
 
-	payload := jiraIssueCreateRequest{Fields: fields}
+	type fieldChange struct {
+		Field  string
+		Reason string
+		Old    string
+		New    string
+	}
+	var changes []fieldChange
+
+	if !stringSlicesEqualIgnoreOrder(snapshot.Labels, desired) {
+		changes = append(changes, fieldChange{
+			Field:  "labels",
+			Reason: fmt.Sprintf("Keeping Jira labels aligned with GitHub %s.", repoRef),
+			Old:    formatLogValue(sortedStrings(snapshot.Labels)),
+			New:    formatLogValue(sortedStrings(desired)),
+		})
+	}
+
+	if !jiraADFDocsEqual(snapshot.Environment, envDoc) {
+		changes = append(changes, fieldChange{
+			Field:  "environment",
+			Reason: fmt.Sprintf("Refreshing environment details from GitHub %s.", repoRef),
+			Old:    formatLogValue(snapshot.Environment),
+			New:    formatLogValue(envDoc),
+		})
+	}
+
+	if len(components) > 0 {
+		oldComponentNames := componentNamesFromSnapshot(snapshot.Components)
+		newComponentNames := componentNamesFromConfig(components)
+		if !stringSlicesEqualIgnoreOrder(oldComponentNames, newComponentNames) {
+			changes = append(changes, fieldChange{
+				Field:  "components",
+				Reason: fmt.Sprintf("Enforcing repository component mapping for %s.", repoRef),
+				Old:    formatLogValue(sortedStrings(oldComponentNames)),
+				New:    formatLogValue(sortedStrings(newComponentNames)),
+			})
+		}
+	}
+
+	if teamFieldKey != "" && teamOptionID != "" {
+		if !strings.EqualFold(strings.TrimSpace(snapshot.TeamOptionID), teamOptionID) {
+			changes = append(changes, fieldChange{
+				Field:  teamFieldKey,
+				Reason: fmt.Sprintf("Applying configured team option for %s.", repoRef),
+				Old:    formatLogValue(strings.TrimSpace(snapshot.TeamOptionID)),
+				New:    formatLogValue(teamOptionID),
+			})
+		}
+	}
+
+	if assignDecisionMade {
+		oldAssigneeID := strings.TrimSpace(snapshot.AssigneeAccountID)
+		newAssigneeID := newAssigneeAccountID
+		if shouldClearAssignee {
+			newAssigneeID = ""
+		}
+		if oldAssigneeID != newAssigneeID {
+			reason := fmt.Sprintf("Aligning Jira assignee with GitHub %s.", repoRef)
+			if shouldClearAssignee {
+				reason = fmt.Sprintf("Clearing Jira assignee to mirror GitHub %s.", repoRef)
+			}
+			oldValue := assigneeLogValue(snapshot.AssigneeAccountID, snapshot.AssigneeDisplayName)
+			var newValue any
+			if newAssigneeID == "" {
+				newValue = nil
+			} else {
+				newValue = map[string]string{"accountId": newAssigneeID}
+			}
+			changes = append(changes, fieldChange{
+				Field:  "assignee",
+				Reason: reason,
+				Old:    formatLogValue(oldValue),
+				New:    formatLogValue(newValue),
+			})
+		}
+	}
+
+	if len(changes) == 0 {
+		log.Printf("Jira issue %s already reflects GitHub %s; no field changes required.", issueKey, repoRef)
+		return nil
+	}
+
+	payload := jiraIssueCreateRequest{Fields: fieldPayload}
 
 	b, _ := json.Marshal(payload)
 	reqURL := fmt.Sprintf("%s/rest/api/3/issue/%s", strings.TrimRight(cfg.JiraBaseURL, "/"), url.PathEscape(issueKey))
@@ -1254,6 +1370,9 @@ func jiraUpdateFromGitHubIssue(ctx context.Context, cfg config, issueKey string,
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode == 204 {
+		for _, change := range changes {
+			log.Printf("Jira %s update (%s): field=%s old=%s new=%s", issueKey, change.Reason, change.Field, change.Old, change.New)
+		}
 		return nil
 	}
 	body, _ := io.ReadAll(io.LimitReader(resp.Body, 8192))
@@ -1275,15 +1394,24 @@ func jiraUpdateFromGitHubIssueWithStatus(ctx context.Context, cfg config, jiraIs
 
 	// Get current status
 	currentStatus := jiraIssue.Fields.Status.Name
+	repoRef := fmt.Sprintf("%s/%s#%d", cfg.UserConfig.GitHubOwner, repo, is.Number)
+	githubState := is.State
+	if is.PullRequest != nil {
+		if is.Merged {
+			githubState = "merged"
+		} else if is.Draft {
+			githubState = "draft"
+		}
+	}
 
 	// Handle the "NOT_CLOSED" rule for open GitHub issues/PRs
 	if desiredStatus == "NOT_CLOSED" {
 		// For open GitHub items, we want any status except the closed status
 		if isClosedStatus(currentStatus) {
 			// Current status is "Done/Closed" but GitHub is open - need to reopen
-			log.Printf("GitHub %s/%s#%d is open but Jira issue %s is %q, attempting to reopen to %q",
-				cfg.UserConfig.GitHubOwner, repo, is.Number, jiraIssue.Key, currentStatus, cfg.UserConfig.JiraStatusReopened)
-			return jiraTransitionStatus(ctx, cfg, jiraIssue.Key, currentStatus, cfg.UserConfig.JiraStatusReopened)
+			reason := fmt.Sprintf("GitHub %s reopened; restoring workflow alignment.", repoRef)
+			log.Printf("Preparing Jira %s status update (%s): old=%q target=%q", jiraIssue.Key, reason, currentStatus, cfg.UserConfig.JiraStatusReopened)
+			return jiraTransitionStatus(ctx, cfg, jiraIssue.Key, currentStatus, cfg.UserConfig.JiraStatusReopened, reason)
 		} else {
 			// Current status is fine (not closed), leave it as is
 			log.Printf("GitHub %s/%s#%d is open and Jira issue %s is %q (acceptable, not changing)",
@@ -1299,19 +1427,11 @@ func jiraUpdateFromGitHubIssueWithStatus(ctx context.Context, cfg config, jiraIs
 	}
 
 	// Log the status transition attempt
-	githubState := is.State
-	if is.PullRequest != nil {
-		if is.Merged {
-			githubState = "merged"
-		} else if is.Draft {
-			githubState = "draft"
-		}
-	}
-	log.Printf("GitHub %s/%s#%d is %q, attempting to transition Jira issue %s from %q to %q",
-		cfg.UserConfig.GitHubOwner, repo, is.Number, githubState, jiraIssue.Key, currentStatus, desiredStatus)
+	reason := fmt.Sprintf("GitHub %s is %q; syncing Jira workflow.", repoRef, githubState)
+	log.Printf("Preparing Jira %s status update (%s): old=%q target=%q", jiraIssue.Key, reason, currentStatus, desiredStatus)
 
 	// Perform status transition
-	return jiraTransitionStatus(ctx, cfg, jiraIssue.Key, currentStatus, desiredStatus)
+	return jiraTransitionStatus(ctx, cfg, jiraIssue.Key, currentStatus, desiredStatus, reason)
 }
 
 // getDesiredJiraStatus maps GitHub issue/PR state to desired Jira status
@@ -1371,8 +1491,8 @@ func statusNamesMatch(status1, status2 string) bool {
 	return false
 }
 
-// jiraTransitionStatus transitions a Jira issue to the specified status
-func jiraTransitionStatus(ctx context.Context, cfg config, issueKey, currentStatus, targetStatus string) error {
+// jiraTransitionStatus transitions a Jira issue to the specified status.
+func jiraTransitionStatus(ctx context.Context, cfg config, issueKey, currentStatus, targetStatus, reason string) error {
 	// Get available transitions
 	transitions, err := jiraGetTransitions(ctx, cfg, issueKey)
 	if err != nil {
@@ -1435,11 +1555,11 @@ func jiraTransitionStatus(ctx context.Context, cfg config, issueKey, currentStat
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode == 204 {
+		finalStatus := targetStatus
 		if matchedStatusName != "" && !strings.EqualFold(matchedStatusName, targetStatus) {
-			log.Printf("transitioned Jira issue %s from %q to %q (matched as %q)", issueKey, currentStatus, targetStatus, matchedStatusName)
-		} else {
-			log.Printf("transitioned Jira issue %s from %q to %q", issueKey, currentStatus, targetStatus)
+			finalStatus = matchedStatusName
 		}
+		log.Printf("Jira %s status update (%s): old=%q new=%q", issueKey, reason, currentStatus, finalStatus)
 		return nil
 	}
 	body, _ := io.ReadAll(io.LimitReader(resp.Body, 8192))
@@ -1471,7 +1591,11 @@ func jiraGetTransitions(ctx context.Context, cfg config, issueKey string) ([]jir
 
 func jiraGetIssueSyncFields(ctx context.Context, cfg config, issueKey string) (jiraIssueSyncFields, error) {
 	client := &http.Client{Timeout: cfg.HTTPTimeout}
-	fieldsParam := fmt.Sprintf("labels,%s", jiraSprintFieldKey)
+	fieldList := []string{"labels", jiraSprintFieldKey, "environment", "components", "assignee"}
+	if teamFieldKey := strings.TrimSpace(cfg.UserConfig.JiraTeamFieldKey); teamFieldKey != "" {
+		fieldList = append(fieldList, teamFieldKey)
+	}
+	fieldsParam := strings.Join(fieldList, ",")
 	reqURL := fmt.Sprintf("%s/rest/api/3/issue/%s?fields=%s", strings.TrimRight(cfg.JiraBaseURL, "/"), url.PathEscape(issueKey), url.QueryEscape(fieldsParam))
 	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, reqURL, nil)
 	req.Header.Set("Authorization", jiraAuthHeader(cfg.JiraEmail, cfg.JiraAPIToken))
@@ -1486,18 +1610,56 @@ func jiraGetIssueSyncFields(ctx context.Context, cfg config, issueKey string) (j
 		return jiraIssueSyncFields{}, fmt.Errorf("jira get issue sync fields status %d: %s", resp.StatusCode, string(b))
 	}
 	var out struct {
-		Fields struct {
-			Labels  []string       `json:"labels"`
-			Sprints jsontext.Value `json:"customfield_10020"`
-		} `json:"fields"`
+		Fields map[string]jsontext.Value `json:"fields"`
 	}
 	if err := json.UnmarshalRead(resp.Body, &out); err != nil {
 		return jiraIssueSyncFields{}, err
 	}
-	return jiraIssueSyncFields{
-		Labels:  out.Fields.Labels,
-		Sprints: parseSprintField(out.Fields.Sprints),
-	}, nil
+	var snapshot jiraIssueSyncFields
+	if labelsRaw, ok := out.Fields["labels"]; ok && len(labelsRaw) > 0 {
+		var labels []string
+		if err := json.Unmarshal([]byte(labelsRaw), &labels); err == nil {
+			snapshot.Labels = labels
+		}
+	}
+	if sprintsRaw, ok := out.Fields[jiraSprintFieldKey]; ok && len(sprintsRaw) > 0 {
+		snapshot.Sprints = parseSprintField(sprintsRaw)
+	}
+	if envRaw, ok := out.Fields["environment"]; ok && len(envRaw) > 0 {
+		var env jiraADFDoc
+		if err := json.Unmarshal([]byte(envRaw), &env); err == nil {
+			snapshot.Environment = &env
+		}
+	}
+	if componentsRaw, ok := out.Fields["components"]; ok && len(componentsRaw) > 0 {
+		var components []jiraComponent
+		if err := json.Unmarshal([]byte(componentsRaw), &components); err == nil {
+			snapshot.Components = components
+		}
+	}
+	if assigneeRaw, ok := out.Fields["assignee"]; ok && len(assigneeRaw) > 0 {
+		var assignee jiraUserRef
+		if err := json.Unmarshal([]byte(assigneeRaw), &assignee); err == nil {
+			snapshot.AssigneeAccountID = strings.TrimSpace(assignee.AccountID)
+			snapshot.AssigneeDisplayName = strings.TrimSpace(assignee.DisplayName)
+		}
+	}
+	if teamFieldKey := strings.TrimSpace(cfg.UserConfig.JiraTeamFieldKey); teamFieldKey != "" {
+		if teamRaw, ok := out.Fields[teamFieldKey]; ok && len(teamRaw) > 0 {
+			var team struct {
+				ID string `json:"id,omitzero"`
+			}
+			if err := json.Unmarshal([]byte(teamRaw), &team); err == nil && strings.TrimSpace(team.ID) != "" {
+				snapshot.TeamOptionID = strings.TrimSpace(team.ID)
+			} else {
+				var id string
+				if err := json.Unmarshal([]byte(teamRaw), &id); err == nil {
+					snapshot.TeamOptionID = strings.TrimSpace(id)
+				}
+			}
+		}
+	}
+	return snapshot, nil
 }
 
 func parseSprintField(raw jsontext.Value) []jiraSprint {
@@ -2001,6 +2163,116 @@ func truncate(s string, n int) string {
 		return s
 	}
 	return s[:n]
+}
+
+func sortedStrings(in []string) []string {
+	if len(in) == 0 {
+		return []string{}
+	}
+	out := make([]string, 0, len(in))
+	for _, v := range in {
+		out = append(out, v)
+	}
+	sort.Strings(out)
+	return out
+}
+
+func stringSlicesEqualIgnoreOrder(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	counts := make(map[string]int, len(a))
+	for _, v := range a {
+		counts[strings.TrimSpace(v)]++
+	}
+	for _, v := range b {
+		key := strings.TrimSpace(v)
+		if count, ok := counts[key]; !ok || count == 0 {
+			return false
+		} else {
+			if count == 1 {
+				delete(counts, key)
+			} else {
+				counts[key] = count - 1
+			}
+		}
+	}
+	return len(counts) == 0
+}
+
+func jiraADFDocsEqual(a, b *jiraADFDoc) bool {
+	switch {
+	case a == nil && b == nil:
+		return true
+	case a == nil || b == nil:
+		return false
+	}
+	ab, err := json.Marshal(a)
+	if err != nil {
+		return false
+	}
+	bb, err := json.Marshal(b)
+	if err != nil {
+		return false
+	}
+	return bytes.Equal(ab, bb)
+}
+
+func componentNamesFromSnapshot(components []jiraComponent) []string {
+	if len(components) == 0 {
+		return []string{}
+	}
+	names := make([]string, 0, len(components))
+	for _, component := range components {
+		if name := strings.TrimSpace(component.Name); name != "" {
+			names = append(names, name)
+		}
+	}
+	return names
+}
+
+func componentNamesFromConfig(components []map[string]any) []string {
+	if len(components) == 0 {
+		return []string{}
+	}
+	names := make([]string, 0, len(components))
+	for _, component := range components {
+		if rawName, ok := component["name"]; ok {
+			if name, ok := rawName.(string); ok {
+				if trimmed := strings.TrimSpace(name); trimmed != "" {
+					names = append(names, trimmed)
+				}
+			}
+		}
+	}
+	return names
+}
+
+func formatLogValue(value any) string {
+	if value == nil {
+		return "null"
+	}
+	b, err := json.Marshal(value)
+	if err != nil {
+		return fmt.Sprintf("%v", value)
+	}
+	return string(b)
+}
+
+func assigneeLogValue(accountID, displayName string) any {
+	accountID = strings.TrimSpace(accountID)
+	displayName = strings.TrimSpace(displayName)
+	if accountID == "" && displayName == "" {
+		return nil
+	}
+	value := map[string]string{}
+	if accountID != "" {
+		value["accountId"] = accountID
+	}
+	if displayName != "" {
+		value["displayName"] = displayName
+	}
+	return value
 }
 
 func uniqueStrings(in []string) []string {
