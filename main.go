@@ -338,7 +338,7 @@ func runCycle(ctx context.Context, cfg config) {
 
 		for _, is := range issues {
 			// Use the new function that includes status information
-			existingIssue, err := jiraFindExistingWithStatus(ctx, cfg, repo, is.Number)
+			existingIssue, err := jiraFindExistingWithStatus(ctx, cfg, repo, is)
 			if err != nil {
 				log.Printf("warn: jira search failed for %s/%s#%d: %v", cfg.UserConfig.GitHubOwner, repo, is.Number, err)
 				continue
@@ -847,6 +847,33 @@ func removeBacklinkLine(body string) string {
 	return strings.Join(keep, "\n")
 }
 
+func extractJiraKeyFromBacklink(body string) string {
+	if !strings.Contains(body, githubJiraBacklinkMarker) {
+		return ""
+	}
+	const prefix = "CyberArk tracker:"
+	for _, line := range strings.Split(body, "\n") {
+		if !strings.Contains(line, githubJiraBacklinkMarker) {
+			continue
+		}
+		trimmed := strings.TrimSpace(line)
+		start := strings.Index(trimmed, prefix)
+		if start == -1 {
+			continue
+		}
+		segment := strings.TrimSpace(trimmed[start+len(prefix):])
+		if !strings.HasPrefix(segment, "[") {
+			continue
+		}
+		closing := strings.Index(segment, "]")
+		if closing <= 1 {
+			continue
+		}
+		return strings.TrimSpace(segment[1:closing])
+	}
+	return ""
+}
+
 func buildJiraBacklinkLine(cfg config, jiraKey string) string {
 	targetURL := buildJiraBrowseURL(cfg, jiraKey)
 	return fmt.Sprintf("CyberArk tracker: [%s](%s) %s", jiraKey, targetURL, githubJiraBacklinkMarker)
@@ -877,43 +904,59 @@ func determineJiraAssignee(ctx context.Context, cfg config, repo string, is ghIs
 		}
 	}
 
-	var candidates []string
-
 	// Create a set of CyberArk known users for quick lookup.
 	cyberArkUsers := make(map[string]bool)
 	for _, user := range cfg.UserConfig.CyberArkKnownUsers {
 		cyberArkUsers[user] = true
 	}
 
-	// Start with the author if known at CyberArk.
-	if is.User.Login != "" {
-		if cyberArkUsers[is.User.Login] {
+	var (
+		candidates     []string
+		reviewerLoader sync.Once
+		reviewers      []ghUser
+	)
+
+	loadReviewers := func() []ghUser {
+		if is.PullRequest == nil {
+			return nil
+		}
+		reviewerLoader.Do(func() {
+			var err error
+			reviewers, err = fetchGitHubPRReviewers(ctx, cfg, repo, is.Number)
+			if err != nil {
+				log.Printf("warn: failed to fetch reviewers for %s/%s#%d: %v", cfg.UserConfig.GitHubOwner, repo, is.Number, err)
+				reviewers = nil
+			}
+		})
+		return reviewers
+	}
+
+	if is.PullRequest != nil {
+		for _, assignee := range is.Assignees {
+			if assignee.Login != "" && cyberArkUsers[assignee.Login] {
+				candidates = append(candidates, assignee.Login)
+			}
+		}
+		for _, reviewer := range loadReviewers() {
+			if reviewer.Login != "" && cyberArkUsers[reviewer.Login] {
+				candidates = append(candidates, reviewer.Login)
+			}
+		}
+		if is.User.Login != "" && cyberArkUsers[is.User.Login] {
 			candidates = append(candidates, is.User.Login)
 		}
-	}
-
-	// Add assignees if known at CyberArk.
-	for _, assignee := range is.Assignees {
-		if assignee.Login != "" && cyberArkUsers[assignee.Login] {
-			candidates = append(candidates, assignee.Login)
+	} else {
+		if is.User.Login != "" && cyberArkUsers[is.User.Login] {
+			candidates = append(candidates, is.User.Login)
 		}
-	}
-
-	// For PRs, also check reviewers.
-	if is.PullRequest != nil {
-		reviewers, err := fetchGitHubPRReviewers(ctx, cfg, repo, is.Number)
-		if err != nil {
-			log.Printf("warn: failed to fetch reviewers for %s/%s#%d: %v", cfg.UserConfig.GitHubOwner, repo, is.Number, err)
-		} else {
-			for _, reviewer := range reviewers {
-				if reviewer.Login != "" && cyberArkUsers[reviewer.Login] {
-					candidates = append(candidates, reviewer.Login)
-				}
+		for _, assignee := range is.Assignees {
+			if assignee.Login != "" && cyberArkUsers[assignee.Login] {
+				candidates = append(candidates, assignee.Login)
 			}
 		}
 	}
 
-	// If author is not known at CyberArk, fallback to assignees and reviewers.
+	// If no CyberArk candidate is available, fallback to assignees and reviewers.
 	if len(candidates) == 0 {
 		// Add any assignee (even if not known at CyberArk).
 		for _, assignee := range is.Assignees {
@@ -924,12 +967,9 @@ func determineJiraAssignee(ctx context.Context, cfg config, repo string, is ghIs
 
 		// For PRs, add any reviewer
 		if is.PullRequest != nil {
-			reviewers, err := fetchGitHubPRReviewers(ctx, cfg, repo, is.Number)
-			if err == nil {
-				for _, reviewer := range reviewers {
-					if reviewer.Login != "" {
-						candidates = append(candidates, reviewer.Login)
-					}
+			for _, reviewer := range loadReviewers() {
+				if reviewer.Login != "" {
+					candidates = append(candidates, reviewer.Login)
 				}
 			}
 		}
@@ -958,7 +998,39 @@ func jiraAuthHeader(email, token string) string {
 	return "Basic " + base64.StdEncoding.EncodeToString([]byte(raw))
 }
 
-func jiraFindExisting(ctx context.Context, cfg config, repo string, ghNumber int) (string, error) {
+func jiraGetBasicIssue(ctx context.Context, cfg config, issueKey string) (*jiraBasicIssue, error) {
+	client := &http.Client{Timeout: cfg.HTTPTimeout}
+	reqURL := fmt.Sprintf("%s/rest/api/3/issue/%s?fields=status", strings.TrimRight(cfg.JiraBaseURL, "/"), url.PathEscape(issueKey))
+	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, reqURL, nil)
+	req.Header.Set("Authorization", jiraAuthHeader(cfg.JiraEmail, cfg.JiraAPIToken))
+	req.Header.Set("Accept", "application/json")
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode == 404 {
+		return nil, nil
+	}
+	if resp.StatusCode != 200 {
+		bdy, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		return nil, fmt.Errorf("jira get issue %s status %d: %s", issueKey, resp.StatusCode, string(bdy))
+	}
+	var issue jiraBasicIssue
+	if err := json.UnmarshalRead(resp.Body, &issue); err != nil {
+		return nil, err
+	}
+	return &issue, nil
+}
+
+func jiraFindExisting(ctx context.Context, cfg config, repo string, is ghIssue) (string, error) {
+	if key := extractJiraKeyFromBacklink(is.Body); key != "" {
+		return key, nil
+	}
+	return jiraFindExistingByEnvironment(ctx, cfg, repo, is.Number)
+}
+
+func jiraFindExistingByEnvironment(ctx context.Context, cfg config, repo string, ghNumber int) (string, error) {
 	client := &http.Client{Timeout: cfg.HTTPTimeout}
 	token := escapeJQLString(summaryPrefix(cfg.UserConfig.GitHubOwner, repo, ghNumber))
 	jql := fmt.Sprintf(`project = %s AND environment ~ "%s"`, cfg.UserConfig.JiraProjectKey, token)
@@ -1065,7 +1137,21 @@ func jiraCreateFromGitHubIssue(ctx context.Context, cfg config, repo string, is 
 	return out.Key, nil
 }
 
-func jiraFindExistingWithStatus(ctx context.Context, cfg config, repo string, ghNumber int) (*jiraBasicIssue, error) {
+func jiraFindExistingWithStatus(ctx context.Context, cfg config, repo string, is ghIssue) (*jiraBasicIssue, error) {
+	if key := extractJiraKeyFromBacklink(is.Body); key != "" {
+		issue, err := jiraGetBasicIssue(ctx, cfg, key)
+		if err != nil {
+			return nil, err
+		}
+		if issue != nil {
+			return issue, nil
+		}
+		return jiraFindExistingWithStatusByEnvironment(ctx, cfg, repo, is.Number)
+	}
+	return jiraFindExistingWithStatusByEnvironment(ctx, cfg, repo, is.Number)
+}
+
+func jiraFindExistingWithStatusByEnvironment(ctx context.Context, cfg config, repo string, ghNumber int) (*jiraBasicIssue, error) {
 	client := &http.Client{Timeout: cfg.HTTPTimeout}
 	token := escapeJQLString(summaryPrefix(cfg.UserConfig.GitHubOwner, repo, ghNumber))
 	jql := fmt.Sprintf(`project = %s AND environment ~ "%s"`, cfg.UserConfig.JiraProjectKey, token)
