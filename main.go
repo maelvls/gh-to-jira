@@ -1216,8 +1216,7 @@ func jiraUpdateFromGitHubIssue(ctx context.Context, cfg config, issueKey string,
 		log.Printf("warn: failed to load labels and sprint for %s: %v", issueKey, err)
 	}
 	desired := uniqueStrings(append(snapshot.Labels, []string{"OpenSource", "gh-to-jira", fmt.Sprintf("repo:%s", repo)}...))
-	assignSprint := jiraTargetSprintName != "" && !issueHasSprint(snapshot.Sprints, jiraTargetSprintName)
-
+	// We no longer force sprint updates here so Jira users can control the field after creation.
 	fields := map[string]any{
 		"labels":      desired,
 		"environment": buildEnvironmentADF(cfg.UserConfig.GitHubOwner, repo, is.Number, is.HTMLURL),
@@ -1226,13 +1225,11 @@ func jiraUpdateFromGitHubIssue(ctx context.Context, cfg config, issueKey string,
 		fields["components"] = components
 	}
 
-	// Ensure team remains set on updates as well, if configured
+	// Ensure team remains set on updates as well, if configured.
 	if cfg.UserConfig.JiraTeamFieldKey != "" && cfg.UserConfig.JiraTeamOptionID != "" {
 		fields[cfg.UserConfig.JiraTeamFieldKey] = map[string]any{"id": cfg.UserConfig.JiraTeamOptionID}
 	}
-	if capacityCategory := determineCapacityCategory(is); capacityCategory != "" {
-		fields[jiraCapacityCategoryField] = map[string]any{"value": capacityCategory}
-	}
+	// Capacity category remains untouched during updates so teams can adjust it in Jira.
 
 	// Update assignee based on GitHub issue/PR data
 	if assigneeAccountID, clearAssignee, err := determineJiraAssignee(ctx, cfg, repo, is); err != nil {
@@ -1257,11 +1254,6 @@ func jiraUpdateFromGitHubIssue(ctx context.Context, cfg config, issueKey string,
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode == 204 {
-		if assignSprint {
-			if err := ensureIssueInTargetSprint(ctx, cfg, issueKey, snapshot.Sprints); err != nil {
-				return err
-			}
-		}
 		return nil
 	}
 	body, _ := io.ReadAll(io.LimitReader(resp.Body, 8192))
