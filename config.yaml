@@ -29,6 +29,7 @@ jira_skip_description: false         # Set to true to omit description field (us
 # =============================================================================
 jira_status_open: "To Do"            # Status for open GitHub issues/PRs
 jira_status_closed: "Done"           # Status for closed/merged GitHub issues/PRs  
+jira_status_in_progress: "In Progress" # Status when a GitHub item has assignees.
 jira_status_draft: "In Progress"     # Status for draft PRs
 jira_status_reopened: "Reopened"     # Status for reopening closed tickets
 jira_resolution: "Done"              # Resolution to set when closing tickets (common: "Done", "Fixed", "Resolved")

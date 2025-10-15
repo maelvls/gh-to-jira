@@ -47,14 +47,6 @@ type ghUser struct {
 	ID    int    `json:"id"`
 }
 
-type ghReviewer struct {
-	User ghUser `json:"user,omitzero"`
-}
-
-type ghReviewRequest struct {
-	Users []ghUser `json:"users,omitzero"`
-}
-
 // UserConfig represents the YAML configuration for user mappings and application settings
 type UserConfig struct {
 	// GitHub configuration
@@ -72,10 +64,11 @@ type UserConfig struct {
 	JiraSkipDescription bool   `yaml:"jira_skip_description"`
 
 	// Jira status mapping
-	JiraStatusOpen     string `yaml:"jira_status_open"`
-	JiraStatusClosed   string `yaml:"jira_status_closed"`
-	JiraStatusDraft    string `yaml:"jira_status_draft"`
-	JiraStatusReopened string `yaml:"jira_status_reopened"`
+	JiraStatusOpen       string `yaml:"jira_status_open"`
+	JiraStatusClosed     string `yaml:"jira_status_closed"`
+	JiraStatusInProgress string `yaml:"jira_status_in_progress"`
+	JiraStatusDraft      string `yaml:"jira_status_draft"`
+	JiraStatusReopened   string `yaml:"jira_status_reopened"`
 
 	// Jira resolution (for closing tickets)
 	JiraResolution string `yaml:"jira_resolution"`
@@ -363,8 +356,8 @@ func runCycle(ctx context.Context, cfg config) {
 			}
 			if existingIssue != nil {
 				if cfg.DryRun {
-					desiredStatus := getDesiredJiraStatus(cfg, is)
 					currentStatus := existingIssue.Fields.Status.Name
+					desiredStatus := getDesiredJiraStatus(cfg, is, currentStatus)
 					statusMsg := ""
 					if desiredStatus != "" {
 						if desiredStatus == "NOT_CLOSED" {
@@ -379,6 +372,8 @@ func runCycle(ctx context.Context, cfg config) {
 						} else {
 							statusMsg = fmt.Sprintf(" (status: already %q)", currentStatus)
 						}
+					} else {
+						statusMsg = fmt.Sprintf(" (status: keeping %q)", currentStatus)
 					}
 					assigneeInfo := ""
 					if assigneeAccountID, clearAssignee, err := determineJiraAssignee(ctx, cfg, repo, is); err != nil {
@@ -521,17 +516,18 @@ func resolveConfigPath(flagValue string) string {
 func loadUserConfig(cfg *config) error {
 	// Set defaults for all configuration values
 	cfg.UserConfig = UserConfig{
-		GitHubOwner:         "cert-manager",
-		GitHubLabel:         "cybr",
-		JiraIssueType:       "Task",
-		JiraStatusOpen:      "To Do",
-		JiraStatusClosed:    "Done",
-		JiraStatusDraft:     "In Progress",
-		JiraStatusReopened:  "Reopened",
-		JiraResolution:      "Done",
-		GitHubToJiraUsers:   make(map[string]string),
-		CyberArkKnownUsers:  []string{},
-		JiraSkipDescription: true,
+		GitHubOwner:          "cert-manager",
+		GitHubLabel:          "cybr",
+		JiraIssueType:        "Task",
+		JiraStatusOpen:       "To Do",
+		JiraStatusClosed:     "Done",
+		JiraStatusInProgress: "In Progress",
+		JiraStatusDraft:      "In Progress",
+		JiraStatusReopened:   "Reopened",
+		JiraResolution:       "Done",
+		GitHubToJiraUsers:    make(map[string]string),
+		CyberArkKnownUsers:   []string{},
+		JiraSkipDescription:  true,
 	}
 
 	// Check if file exists
@@ -582,6 +578,9 @@ func loadUserConfig(cfg *config) error {
 	}
 	if userConfig.JiraStatusClosed != "" {
 		cfg.UserConfig.JiraStatusClosed = userConfig.JiraStatusClosed
+	}
+	if userConfig.JiraStatusInProgress != "" {
+		cfg.UserConfig.JiraStatusInProgress = userConfig.JiraStatusInProgress
 	}
 	if userConfig.JiraStatusDraft != "" {
 		cfg.UserConfig.JiraStatusDraft = userConfig.JiraStatusDraft
@@ -742,29 +741,6 @@ func fetchGitHubPRDetails(ctx context.Context, cfg config, repo string, prNumber
 }
 
 // fetchGitHubPRReviewers fetches the reviewers for a PR
-func fetchGitHubPRReviewers(ctx context.Context, cfg config, repo string, prNumber int) ([]ghUser, error) {
-	client := &http.Client{Timeout: cfg.HTTPTimeout}
-	reqURL := fmt.Sprintf("https://api.github.com/repos/%s/%s/pulls/%d/requested_reviewers", url.PathEscape(cfg.UserConfig.GitHubOwner), url.PathEscape(repo), prNumber)
-	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, reqURL, nil)
-	req.Header.Set("Authorization", "Bearer "+cfg.GitHubToken)
-	req.Header.Set("Accept", "application/vnd.github+json")
-	req.Header.Set("User-Agent", "gh-to-jira-bot")
-	resp, err := client.Do(req)
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != 200 {
-		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
-		return nil, fmt.Errorf("github PR reviewers: status %d: %s", resp.StatusCode, string(body))
-	}
-	var reviewRequest ghReviewRequest
-	if err := json.UnmarshalRead(resp.Body, &reviewRequest); err != nil {
-		return nil, err
-	}
-	return reviewRequest.Users, nil
-}
-
 func ensureGitHubJiraBacklink(ctx context.Context, cfg config, repo string, is ghIssue, jiraKey string) error {
 	current, err := githubGetIssue(ctx, cfg, repo, is.Number)
 	if err != nil {
@@ -905,108 +881,88 @@ func isAnIssue(is ghIssue) bool {
 	return is.PullRequest == nil
 }
 
+// hasGitHubAssignee reports whether the GitHub item has at least one assignee.
+func hasGitHubAssignee(is ghIssue) bool {
+	if strings.TrimSpace(is.Assignee.Login) != "" {
+		return true
+	}
+	for _, assignee := range is.Assignees {
+		if strings.TrimSpace(assignee.Login) != "" {
+			return true
+		}
+	}
+	return false
+}
+
+func isGitHubOpen(is ghIssue) bool {
+	if is.PullRequest != nil {
+		if is.Merged {
+			return false
+		}
+		return strings.EqualFold(strings.TrimSpace(is.State), "open")
+	}
+	return strings.EqualFold(strings.TrimSpace(is.State), "open")
+}
+
+func isNewStatus(status string, cfg config) bool {
+	status = strings.TrimSpace(status)
+	if status == "" {
+		return true
+	}
+	if statusNamesMatch(status, cfg.UserConfig.JiraStatusOpen) {
+		return true
+	}
+	return strings.EqualFold(status, "new")
+}
+
 // determineJiraAssignee determines the best Jira assignee based on GitHub issue/PR data.
 // Returns a Jira account ID, a flag indicating whether Jira should be explicitly unassigned, and an error.
-func determineJiraAssignee(ctx context.Context, cfg config, repo string, is ghIssue) (string, bool, error) {
-	// Do not assign Jira issues when the GitHub issue itself has no assignee.
-	if isAnIssue(is) {
-		hasGitHubAssignee := false
-		if is.Assignee.Login != "" {
-			hasGitHubAssignee = true
+func determineJiraAssignee(_ context.Context, cfg config, _ string, is ghIssue) (string, bool, error) {
+	// Create a set of CyberArk known users for quick lookup.
+	cyberArkUsers := make(map[string]struct{})
+	for _, user := range cfg.UserConfig.CyberArkKnownUsers {
+		login := strings.ToLower(strings.TrimSpace(user))
+		if login != "" {
+			cyberArkUsers[login] = struct{}{}
 		}
-		if len(is.Assignees) > 0 {
-			hasGitHubAssignee = true
-		}
-		if !hasGitHubAssignee {
+	}
+
+	if login := strings.ToLower(strings.TrimSpace(is.User.Login)); login != "" {
+		if _, isCyberArk := cyberArkUsers[login]; isCyberArk {
 			return "", true, nil
 		}
 	}
 
-	// Create a set of CyberArk known users for quick lookup.
-	cyberArkUsers := make(map[string]bool)
-	for _, user := range cfg.UserConfig.CyberArkKnownUsers {
-		cyberArkUsers[user] = true
+	if !hasGitHubAssignee(is) {
+		return "", true, nil
 	}
 
-	var (
-		candidates     []string
-		reviewerLoader sync.Once
-		reviewers      []ghUser
-	)
+	seen := make(map[string]struct{})
+	var candidates []string
 
-	loadReviewers := func() []ghUser {
-		if is.PullRequest == nil {
-			return nil
-		}
-		reviewerLoader.Do(func() {
-			var err error
-			reviewers, err = fetchGitHubPRReviewers(ctx, cfg, repo, is.Number)
-			if err != nil {
-				log.Printf("warn: failed to fetch reviewers for %s/%s#%d: %v", cfg.UserConfig.GitHubOwner, repo, is.Number, err)
-				reviewers = nil
-			}
-		})
-		return reviewers
+	if login := strings.TrimSpace(is.Assignee.Login); login != "" {
+		candidates = append(candidates, login)
+		seen[login] = struct{}{}
 	}
 
-	if is.PullRequest != nil {
-		for _, assignee := range is.Assignees {
-			if assignee.Login != "" && cyberArkUsers[assignee.Login] {
-				candidates = append(candidates, assignee.Login)
-			}
+	for _, assignee := range is.Assignees {
+		login := strings.TrimSpace(assignee.Login)
+		if login == "" {
+			continue
 		}
-		for _, reviewer := range loadReviewers() {
-			if reviewer.Login != "" && cyberArkUsers[reviewer.Login] {
-				candidates = append(candidates, reviewer.Login)
-			}
+		if _, already := seen[login]; already {
+			continue
 		}
-		if is.User.Login != "" && cyberArkUsers[is.User.Login] {
-			candidates = append(candidates, is.User.Login)
-		}
-	} else {
-		// Prefer GitHub assignees over the reporter when assigning Jira issues.
-		for _, assignee := range is.Assignees {
-			if assignee.Login != "" && cyberArkUsers[assignee.Login] {
-				candidates = append(candidates, assignee.Login)
-			}
-		}
-		if is.User.Login != "" && cyberArkUsers[is.User.Login] {
-			candidates = append(candidates, is.User.Login)
-		}
+		seen[login] = struct{}{}
+		candidates = append(candidates, login)
 	}
 
-	// If no CyberArk candidate is available, fallback to assignees and reviewers.
-	if len(candidates) == 0 {
-		// Add any assignee (even if not known at CyberArk).
-		for _, assignee := range is.Assignees {
-			if assignee.Login != "" {
-				candidates = append(candidates, assignee.Login)
-			}
+	for _, login := range candidates {
+		if accountID, ok := cfg.UserConfig.GitHubToJiraUsers[login]; ok && strings.TrimSpace(accountID) != "" {
+			return strings.TrimSpace(accountID), false, nil
 		}
-
-		if is.PullRequest == nil && is.User.Login != "" {
-			candidates = append(candidates, is.User.Login)
-		}
-
-		// For PRs, add any reviewer
-		if is.PullRequest != nil {
-			for _, reviewer := range loadReviewers() {
-				if reviewer.Login != "" {
-					candidates = append(candidates, reviewer.Login)
-				}
-			}
-		}
-	}
-
-	// Remove duplicates and pick the first candidate
-	seen := make(map[string]bool)
-	for _, candidate := range candidates {
-		if !seen[candidate] {
-			seen[candidate] = true
-			// Check if we have a mapping for this GitHub user
-			if jiraAccountID, exists := cfg.UserConfig.GitHubToJiraUsers[candidate]; exists {
-				return jiraAccountID, false, nil
-			}
+		if accountID, ok := cfg.UserConfig.GitHubToJiraUsers[strings.ToLower(login)]; ok && strings.TrimSpace(accountID) != "" {
+			return strings.TrimSpace(accountID), false, nil
 		}
 	}
 
@@ -1391,14 +1347,13 @@ func jiraUpdateFromGitHubIssueWithStatus(ctx context.Context, cfg config, jiraIs
 		return err
 	}
 
-	// Determine desired Jira status based on GitHub state
-	desiredStatus := getDesiredJiraStatus(cfg, is)
-	if desiredStatus == "" {
-		return nil // No status mapping configured
-	}
-
 	// Get current status
 	currentStatus := jiraIssue.Fields.Status.Name
+	// Determine desired Jira status based on GitHub state
+	desiredStatus := getDesiredJiraStatus(cfg, is, currentStatus)
+	if desiredStatus == "" {
+		return nil // No status change needed
+	}
 	repoRef := fmt.Sprintf("%s/%s#%d", cfg.UserConfig.GitHubOwner, repo, is.Number)
 	githubState := is.State
 	if is.PullRequest != nil {
@@ -1440,31 +1395,46 @@ func jiraUpdateFromGitHubIssueWithStatus(ctx context.Context, cfg config, jiraIs
 }
 
 // getDesiredJiraStatus maps GitHub issue/PR state to desired Jira status
-func getDesiredJiraStatus(cfg config, is ghIssue) string {
+func getDesiredJiraStatus(cfg config, is ghIssue, currentStatus string) string {
+	hasAssignee := hasGitHubAssignee(is)
+	inProgressStatus := strings.TrimSpace(cfg.UserConfig.JiraStatusInProgress)
+	if inProgressStatus == "" {
+		inProgressStatus = strings.TrimSpace(cfg.UserConfig.JiraStatusDraft)
+	}
+	currentStatus = strings.TrimSpace(currentStatus)
+	assignedAndOpen := hasAssignee && isGitHubOpen(is)
+
 	if is.PullRequest != nil {
 		// This is a PR
 		if is.Merged {
 			return cfg.UserConfig.JiraStatusClosed
 		}
 		if is.Draft {
+			if hasAssignee && inProgressStatus != "" {
+				return inProgressStatus
+			}
 			return cfg.UserConfig.JiraStatusDraft
 		}
 		if is.State == "closed" {
 			return cfg.UserConfig.JiraStatusClosed
-		}
-		if is.State == "open" {
-			// For open PRs, any status except closed/done is acceptable
-			return "NOT_CLOSED" // Special marker meaning "any status except closed"
 		}
 	} else {
 		// This is an issue
 		if is.State == "closed" {
 			return cfg.UserConfig.JiraStatusClosed
 		}
-		if is.State == "open" {
-			// For open issues, any status except closed/done is acceptable
-			return "NOT_CLOSED" // Special marker meaning "any status except closed"
+	}
+
+	if assignedAndOpen && inProgressStatus != "" {
+		if currentStatus == "" || isNewStatus(currentStatus, cfg) || isClosedStatus(currentStatus) {
+			return inProgressStatus
 		}
+		return ""
+	}
+
+	if isGitHubOpen(is) {
+		// For open GitHub items, any status except closed/done is acceptable.
+		return "NOT_CLOSED" // Special marker meaning "any status except closed".
 	}
 	return ""
 }
