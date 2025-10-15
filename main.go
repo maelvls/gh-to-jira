@@ -964,13 +964,14 @@ func determineJiraAssignee(ctx context.Context, cfg config, repo string, is ghIs
 			candidates = append(candidates, is.User.Login)
 		}
 	} else {
-		if is.User.Login != "" && cyberArkUsers[is.User.Login] {
-			candidates = append(candidates, is.User.Login)
-		}
+		// Prefer GitHub assignees over the reporter when assigning Jira issues.
 		for _, assignee := range is.Assignees {
 			if assignee.Login != "" && cyberArkUsers[assignee.Login] {
 				candidates = append(candidates, assignee.Login)
 			}
+		}
+		if is.User.Login != "" && cyberArkUsers[is.User.Login] {
+			candidates = append(candidates, is.User.Login)
 		}
 	}
 
@@ -981,6 +982,10 @@ func determineJiraAssignee(ctx context.Context, cfg config, repo string, is ghIs
 			if assignee.Login != "" {
 				candidates = append(candidates, assignee.Login)
 			}
+		}
+
+		if is.PullRequest == nil && is.User.Login != "" {
+			candidates = append(candidates, is.User.Login)
 		}
 
 		// For PRs, add any reviewer
