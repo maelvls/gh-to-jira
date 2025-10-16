@@ -15,12 +15,11 @@ import (
 	"net/url"
 	"os"
 	"os/signal"
+	"sort"
 	"strings"
 	"sync"
 	"syscall"
 	"time"
-
-	"sort"
 
 	"github.com/go-yaml/yaml"
 )
@@ -28,7 +27,6 @@ import (
 const (
 	jiraCapacityCategoryField = "customfield_10412"
 	jiraSprintFieldKey        = "customfield_10020"
-	jiraTargetSprintName      = "cert-manager - OpenSource"
 	githubJiraBacklinkMarker  = "<!-- do not edit this line, will be re-added automatically -->"
 )
 
@@ -233,9 +231,31 @@ type jiraTransitionRequest struct {
 }
 
 type jiraSprint struct {
-	ID    int    `json:"id"`
-	Name  string `json:"name"`
-	State string `json:"state,omitzero"`
+	ID        int    `json:"id"`
+	Name      string `json:"name"`
+	State     string `json:"state,omitzero"`
+	StartDate string `json:"startDate,omitzero"`
+	EndDate   string `json:"endDate,omitzero"`
+}
+
+type jiraTeamIteration struct {
+	ID        int    `json:"id"`
+	SprintID  int    `json:"sprintId,omitzero"`
+	Name      string `json:"name"`
+	State     string `json:"state"`
+	StartDate string `json:"startDate,omitzero"`
+	EndDate   string `json:"endDate,omitzero"`
+	BoardID   int    `json:"boardId,omitzero"`
+}
+
+type jiraVersion struct {
+	ID          string `json:"id"`
+	Name        string `json:"name"`
+	Released    bool   `json:"released"`
+	Archived    bool   `json:"archived"`
+	Sequence    int    `json:"sequence,omitzero"`
+	StartDate   string `json:"startDate,omitzero"`
+	ReleaseDate string `json:"releaseDate,omitzero"`
 }
 
 type jiraBoard struct {
@@ -271,6 +291,7 @@ type jiraUserRef struct {
 type jiraIssueSyncFields struct {
 	Labels              []string
 	Sprints             []jiraSprint
+	FixVersions         []jiraVersion
 	Environment         *jiraADFDoc
 	Components          []jiraComponent
 	TeamOptionID        string
@@ -279,14 +300,22 @@ type jiraIssueSyncFields struct {
 }
 
 var targetSprintCache struct {
-	mu sync.Mutex
-	id int
-	ok bool
+	mu      sync.Mutex
+	sprint  jiraSprint
+	err     error
+	expires time.Time
+}
+
+var fixVersionCache struct {
+	mu      sync.Mutex
+	version jiraVersion
+	err     error
+	expires time.Time
 }
 
 var (
-	errSprintNotFound      = errors.New("target sprint not found")
-	errBoardWithoutSprints = errors.New("board has no sprints")
+	errSprintNotFound     = errors.New("target sprint not found")
+	errFixVersionNotFound = errors.New("target fix version not found")
 )
 
 func main() {
@@ -419,8 +448,11 @@ func runCycle(ctx context.Context, cfg config) {
 				continue
 			}
 			log.Printf("created Jira issue %s for %s/%s#%d", key, cfg.UserConfig.GitHubOwner, repo, is.Number)
-			if err := ensureIssueInTargetSprint(ctx, cfg, key, nil); err != nil {
+			alignWithTeamPlan := hasGitHubAssignee(is) || !isGitHubOpen(is)
+			if aligned, err := ensureIssueInCurrentSprint(ctx, cfg, key, nil, alignWithTeamPlan); err != nil {
 				log.Printf("warn: assigning sprint to %s failed: %v", key, err)
+			} else if aligned {
+				// Alignment already logged inside ensureIssueInCurrentSprint.
 			}
 
 			if err := jiraAddRemoteLink(ctx, cfg, key, is.HTMLURL, is.Title); err != nil {
@@ -1180,6 +1212,8 @@ func jiraUpdateFromGitHubIssue(ctx context.Context, cfg config, issueKey string,
 	if err != nil {
 		log.Printf("warn: failed to load labels and sprint for %s: %v", issueKey, err)
 	}
+	hasAssignee := hasGitHubAssignee(is)
+	alignWithTeamPlan := hasAssignee || !isGitHubOpen(is)
 	desired := uniqueStrings(append(snapshot.Labels, []string{"OpenSource", "gh-to-jira", fmt.Sprintf("repo:%s", repo)}...))
 	envDoc := buildEnvironmentADF(cfg.UserConfig.GitHubOwner, repo, is.Number, is.HTMLURL)
 	components := determineJiraComponents(cfg.UserConfig, repo)
@@ -1217,6 +1251,21 @@ func jiraUpdateFromGitHubIssue(ctx context.Context, cfg config, issueKey string,
 			fieldPayload["assignee"] = nil
 		} else if newAssigneeAccountID != "" {
 			fieldPayload["assignee"] = map[string]any{"accountId": newAssigneeAccountID}
+		}
+	}
+
+	var fixVersionForUpdate *jiraVersion
+	if alignWithTeamPlan {
+		if fixVersion, resolveErr := resolveCurrentFixVersion(ctx, cfg); resolveErr != nil {
+			if !errors.Is(resolveErr, errFixVersionNotFound) {
+				log.Printf("warn: failed to resolve fix version for %s: %v", repoRef, resolveErr)
+			}
+		} else if strings.TrimSpace(fixVersion.ID) != "" {
+			if len(snapshot.FixVersions) != 1 || !issueHasFixVersion(snapshot.FixVersions, fixVersion.ID) {
+				copyFixVersion := fixVersion
+				fixVersionForUpdate = &copyFixVersion
+				fieldPayload["fixVersions"] = []map[string]any{{"id": fixVersion.ID}}
+			}
 		}
 	}
 
@@ -1270,6 +1319,15 @@ func jiraUpdateFromGitHubIssue(ctx context.Context, cfg config, issueKey string,
 		}
 	}
 
+	if fixVersionForUpdate != nil {
+		changes = append(changes, fieldChange{
+			Field:  "fixVersions",
+			Reason: fmt.Sprintf("Aligning fix version with current program increment for %s.", repoRef),
+			Old:    formatLogValue(sortedStrings(fixVersionNames(snapshot.FixVersions))),
+			New:    formatLogValue([]string{strings.TrimSpace(fixVersionForUpdate.Name)}),
+		})
+	}
+
 	if assignDecisionMade {
 		oldAssigneeID := strings.TrimSpace(snapshot.AssigneeAccountID)
 		newAssigneeID := newAssigneeAccountID
@@ -1297,8 +1355,19 @@ func jiraUpdateFromGitHubIssue(ctx context.Context, cfg config, issueKey string,
 		}
 	}
 
+	var sprintAligned bool
+	if alignWithTeamPlan {
+		if aligned, sprintErr := ensureIssueInCurrentSprint(ctx, cfg, issueKey, snapshot.Sprints, alignWithTeamPlan); sprintErr != nil {
+			log.Printf("warn: aligning sprint for %s failed: %v", issueKey, sprintErr)
+		} else {
+			sprintAligned = aligned
+		}
+	}
+
 	if len(changes) == 0 {
-		log.Printf("Jira issue %s already reflects GitHub %s; no field changes required.", issueKey, repoRef)
+		if !sprintAligned {
+			log.Printf("Jira issue %s already reflects GitHub %s; no field changes required.", issueKey, repoRef)
+		}
 		return nil
 	}
 
@@ -1551,7 +1620,7 @@ func jiraGetTransitions(ctx context.Context, cfg config, issueKey string) ([]jir
 
 func jiraGetIssueSyncFields(ctx context.Context, cfg config, issueKey string) (jiraIssueSyncFields, error) {
 	client := &http.Client{Timeout: cfg.HTTPTimeout}
-	fieldList := []string{"labels", jiraSprintFieldKey, "environment", "components", "assignee"}
+	fieldList := []string{"labels", jiraSprintFieldKey, "fixVersions", "environment", "components", "assignee"}
 	if teamFieldKey := strings.TrimSpace(cfg.UserConfig.JiraTeamFieldKey); teamFieldKey != "" {
 		fieldList = append(fieldList, teamFieldKey)
 	}
@@ -1584,6 +1653,12 @@ func jiraGetIssueSyncFields(ctx context.Context, cfg config, issueKey string) (j
 	}
 	if sprintsRaw, ok := out.Fields[jiraSprintFieldKey]; ok && len(sprintsRaw) > 0 {
 		snapshot.Sprints = parseSprintField(sprintsRaw)
+	}
+	if fixVersionsRaw, ok := out.Fields["fixVersions"]; ok && len(fixVersionsRaw) > 0 {
+		var fixVersions []jiraVersion
+		if err := json.Unmarshal([]byte(fixVersionsRaw), &fixVersions); err == nil {
+			snapshot.FixVersions = fixVersions
+		}
 	}
 	if envRaw, ok := out.Fields["environment"]; ok && len(envRaw) > 0 {
 		var env jiraADFDoc
@@ -1652,7 +1727,16 @@ func parseSprintField(raw jsontext.Value) []jiraSprint {
 	return nil
 }
 
-func issueHasSprint(sprints []jiraSprint, targetName string) bool {
+func issueHasSprint(sprints []jiraSprint, target jiraSprint) bool {
+	if target.ID <= 0 && strings.TrimSpace(target.Name) == "" {
+		return false
+	}
+	for _, sprint := range sprints {
+		if target.ID > 0 && sprint.ID == target.ID {
+			return true
+		}
+	}
+	targetName := strings.TrimSpace(target.Name)
 	if targetName == "" {
 		return false
 	}
@@ -1664,78 +1748,104 @@ func issueHasSprint(sprints []jiraSprint, targetName string) bool {
 	return false
 }
 
-func ensureIssueInTargetSprint(ctx context.Context, cfg config, issueKey string, currentSprints []jiraSprint) error {
-	if jiraTargetSprintName == "" {
-		return nil
+func ensureIssueInCurrentSprint(ctx context.Context, cfg config, issueKey string, currentSprints []jiraSprint, shouldAlign bool) (bool, error) {
+	if !shouldAlign {
+		return false, nil
 	}
-	if issueHasSprint(currentSprints, jiraTargetSprintName) {
-		return nil
-	}
-	sprintID, err := resolveTargetSprintID(ctx, cfg)
+	sprint, err := resolveCurrentSprint(ctx, cfg)
 	if err != nil {
-		return fmt.Errorf("resolve sprint: %w", err)
+		if errors.Is(err, errSprintNotFound) {
+			return false, nil
+		}
+		return false, fmt.Errorf("resolve sprint: %w", err)
 	}
-	if err := jiraAddIssuesToSprint(ctx, cfg, sprintID, []string{issueKey}); err != nil {
-		return fmt.Errorf("assign issue %s to sprint %d: %w", issueKey, sprintID, err)
+	if sprint.ID <= 0 {
+		return false, nil
 	}
-	return nil
+	if issueHasSprint(currentSprints, sprint) {
+		return false, nil
+	}
+	if err := jiraAddIssuesToSprint(ctx, cfg, sprint.ID, []string{issueKey}); err != nil {
+		return false, fmt.Errorf("assign issue %s to sprint %d: %w", issueKey, sprint.ID, err)
+	}
+	log.Printf("Aligned Jira issue %s with sprint %q (id=%d).", issueKey, sprint.Name, sprint.ID)
+	return true, nil
 }
 
-func resolveTargetSprintID(ctx context.Context, cfg config) (int, error) {
+func resolveCurrentSprint(ctx context.Context, cfg config) (jiraSprint, error) {
+	now := time.Now()
 	targetSprintCache.mu.Lock()
-	if targetSprintCache.ok {
-		id := targetSprintCache.id
+	if now.Before(targetSprintCache.expires) {
+		sprint := targetSprintCache.sprint
+		err := targetSprintCache.err
 		targetSprintCache.mu.Unlock()
-		return id, nil
+		if err != nil {
+			return jiraSprint{}, err
+		}
+		if sprint.ID == 0 {
+			return jiraSprint{}, errSprintNotFound
+		}
+		return sprint, nil
 	}
 	targetSprintCache.mu.Unlock()
 
-	id, err := fetchTargetSprintID(ctx, cfg)
-	if err != nil {
-		return 0, err
-	}
+	sprint, err := fetchCurrentSprint(ctx, cfg)
+	expiry := time.Now().Add(30 * time.Second)
 	targetSprintCache.mu.Lock()
-	targetSprintCache.id = id
-	targetSprintCache.ok = true
+	if err == nil {
+		targetSprintCache.sprint = sprint
+	}
+	targetSprintCache.err = err
+	targetSprintCache.expires = expiry
 	targetSprintCache.mu.Unlock()
-	return id, nil
-}
-
-func fetchTargetSprintID(ctx context.Context, cfg config) (int, error) {
-	boards, err := jiraListBoardsForProject(ctx, cfg)
 	if err != nil {
-		return 0, err
+		return jiraSprint{}, err
 	}
-	if len(boards) == 0 {
-		return 0, fmt.Errorf("no agile boards found for project")
+	if sprint.ID == 0 {
+		return jiraSprint{}, errSprintNotFound
 	}
-	for _, board := range boards {
-		id, err := jiraFindSprintOnBoard(ctx, cfg, board.ID, jiraTargetSprintName)
-		if err == nil {
-			return id, nil
-		}
-		if errors.Is(err, errSprintNotFound) || errors.Is(err, errBoardWithoutSprints) {
-			continue
-		}
-		return 0, err
-	}
-	return 0, fmt.Errorf("sprint %q not found on any board", jiraTargetSprintName)
+	return sprint, nil
 }
 
-func jiraListBoardsForProject(ctx context.Context, cfg config) ([]jiraBoard, error) {
-	keyOrID := strings.TrimSpace(cfg.UserConfig.JiraProjectID)
-	if keyOrID == "" {
-		keyOrID = strings.TrimSpace(cfg.UserConfig.JiraProjectKey)
+func fetchCurrentSprint(ctx context.Context, cfg config) (jiraSprint, error) {
+	teamID := strings.TrimSpace(cfg.UserConfig.JiraTeamOptionID)
+	if teamID == "" {
+		return jiraSprint{}, errSprintNotFound
 	}
-	if keyOrID == "" {
-		return nil, fmt.Errorf("missing Jira project key or id for board lookup")
+	sprint, err := jiraFindTeamSprint(ctx, cfg, teamID)
+	if err != nil {
+		return jiraSprint{}, err
 	}
+	return sprint, nil
+}
+
+func jiraFindTeamSprint(ctx context.Context, cfg config, teamID string) (jiraSprint, error) {
+	active, err := jiraListTeamIterations(ctx, cfg, teamID, "ACTIVE")
+	if err != nil {
+		return jiraSprint{}, err
+	}
+	if len(active) > 0 {
+		selected := selectIteration(active, true)
+		return iterationToSprint(selected), nil
+	}
+	future, err := jiraListTeamIterations(ctx, cfg, teamID, "FUTURE")
+	if err != nil {
+		return jiraSprint{}, err
+	}
+	if len(future) > 0 {
+		selected := selectIteration(future, false)
+		return iterationToSprint(selected), nil
+	}
+	return jiraSprint{}, errSprintNotFound
+}
+
+func jiraListTeamIterations(ctx context.Context, cfg config, teamID, state string) ([]jiraTeamIteration, error) {
 	client := &http.Client{Timeout: cfg.HTTPTimeout}
 	base := strings.TrimRight(cfg.JiraBaseURL, "/")
 	startAt := 0
-	var boards []jiraBoard
+	var iterations []jiraTeamIteration
 	for {
-		reqURL := fmt.Sprintf("%s/rest/agile/1.0/board?projectKeyOrId=%s&startAt=%d&maxResults=50", base, url.QueryEscape(keyOrID), startAt)
+		reqURL := fmt.Sprintf("%s/rest/teams/1.0/teams/%s/iterations?state=%s&startAt=%d&maxResults=50", base, url.PathEscape(teamID), url.QueryEscape(state), startAt)
 		req, _ := http.NewRequestWithContext(ctx, http.MethodGet, reqURL, nil)
 		req.Header.Set("Authorization", jiraAuthHeader(cfg.JiraEmail, cfg.JiraAPIToken))
 		req.Header.Set("Accept", "application/json")
@@ -1746,77 +1856,308 @@ func jiraListBoardsForProject(ctx context.Context, cfg config) ([]jiraBoard, err
 		if resp.StatusCode != 200 {
 			b, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
 			resp.Body.Close()
-			return nil, fmt.Errorf("jira board list status %d: %s", resp.StatusCode, string(b))
+			return nil, fmt.Errorf("jira team iterations status %d: %s", resp.StatusCode, string(b))
 		}
-		var out jiraBoardListResponse
+		var out struct {
+			Values     []jiraTeamIteration `json:"values"`
+			IsLast     bool                `json:"isLast,omitzero"`
+			MaxResults int                 `json:"maxResults,omitzero"`
+		}
 		if decodeErr := json.UnmarshalRead(resp.Body, &out); decodeErr != nil {
 			resp.Body.Close()
 			return nil, decodeErr
 		}
 		resp.Body.Close()
-		boards = append(boards, out.Values...)
-		if out.IsLast || len(out.Values) == 0 {
+		iterations = append(iterations, out.Values...)
+		if out.IsLast || len(out.Values) == 0 || len(out.Values) < out.MaxResults {
 			break
 		}
 		startAt += len(out.Values)
 	}
-	return boards, nil
+	return iterations, nil
 }
 
-func jiraFindSprintOnBoard(ctx context.Context, cfg config, boardID int, targetName string) (int, error) {
+func selectIteration(iterations []jiraTeamIteration, preferLatest bool) jiraTeamIteration {
+	if len(iterations) == 0 {
+		return jiraTeamIteration{}
+	}
+	var (
+		chosen        jiraTeamIteration
+		chosenTime    time.Time
+		chosenHasTime bool
+		set           bool
+	)
+	for _, iter := range iterations {
+		iterTime, hasTime := parseJiraDateTime(iter.StartDate)
+		if !set {
+			chosen = iter
+			chosenTime = iterTime
+			chosenHasTime = hasTime
+			set = true
+			continue
+		}
+		switch {
+		case chosenHasTime && hasTime:
+			if preferLatest {
+				if iterTime.After(chosenTime) || iterTime.Equal(chosenTime) && iter.ID > chosen.ID {
+					chosen = iter
+					chosenTime = iterTime
+				}
+			} else {
+				if iterTime.Before(chosenTime) || iterTime.Equal(chosenTime) && iter.ID < chosen.ID {
+					chosen = iter
+					chosenTime = iterTime
+				}
+			}
+		case hasTime && !chosenHasTime:
+			chosen = iter
+			chosenTime = iterTime
+			chosenHasTime = true
+		case !hasTime && !chosenHasTime:
+			if preferLatest {
+				if iter.ID > chosen.ID {
+					chosen = iter
+				}
+			} else {
+				if iter.ID < chosen.ID {
+					chosen = iter
+				}
+			}
+		}
+	}
+	return chosen
+}
+
+func iterationToSprint(iter jiraTeamIteration) jiraSprint {
+	sprintID := iter.SprintID
+	if sprintID == 0 {
+		sprintID = iter.ID
+	}
+	return jiraSprint{
+		ID:        sprintID,
+		Name:      iter.Name,
+		State:     iter.State,
+		StartDate: iter.StartDate,
+		EndDate:   iter.EndDate,
+	}
+}
+
+func parseJiraDateTime(value string) (time.Time, bool) {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return time.Time{}, false
+	}
+	layouts := []string{
+		time.RFC3339,
+		"2006-01-02T15:04:05.000-0700",
+		"2006-01-02T15:04:05.000Z0700",
+		"2006-01-02",
+	}
+	for _, layout := range layouts {
+		if ts, err := time.Parse(layout, value); err == nil {
+			return ts, true
+		}
+	}
+	return time.Time{}, false
+}
+
+func resolveCurrentFixVersion(ctx context.Context, cfg config) (jiraVersion, error) {
+	now := time.Now()
+	fixVersionCache.mu.Lock()
+	if now.Before(fixVersionCache.expires) {
+		version := fixVersionCache.version
+		err := fixVersionCache.err
+		fixVersionCache.mu.Unlock()
+		if err != nil {
+			return jiraVersion{}, err
+		}
+		if strings.TrimSpace(version.ID) == "" {
+			return jiraVersion{}, errFixVersionNotFound
+		}
+		return version, nil
+	}
+	fixVersionCache.mu.Unlock()
+
+	version, err := fetchCurrentFixVersion(ctx, cfg)
+	expiry := time.Now().Add(2 * time.Minute)
+	fixVersionCache.mu.Lock()
+	if err == nil {
+		fixVersionCache.version = version
+	}
+	fixVersionCache.err = err
+	fixVersionCache.expires = expiry
+	fixVersionCache.mu.Unlock()
+	if err != nil {
+		return jiraVersion{}, err
+	}
+	if strings.TrimSpace(version.ID) == "" {
+		return jiraVersion{}, errFixVersionNotFound
+	}
+	return version, nil
+}
+
+func fetchCurrentFixVersion(ctx context.Context, cfg config) (jiraVersion, error) {
+	versions, err := jiraListProjectVersions(ctx, cfg)
+	if err != nil {
+		return jiraVersion{}, err
+	}
+	if len(versions) == 0 {
+		return jiraVersion{}, errFixVersionNotFound
+	}
+	if version, ok := selectCurrentFixVersion(versions); ok {
+		return version, nil
+	}
+	return jiraVersion{}, errFixVersionNotFound
+}
+
+func jiraListProjectVersions(ctx context.Context, cfg config) ([]jiraVersion, error) {
+	projectKeyOrID := strings.TrimSpace(cfg.UserConfig.JiraProjectID)
+	if projectKeyOrID == "" {
+		projectKeyOrID = strings.TrimSpace(cfg.UserConfig.JiraProjectKey)
+	}
+	if projectKeyOrID == "" {
+		return nil, fmt.Errorf("missing Jira project key or id for version lookup")
+	}
 	client := &http.Client{Timeout: cfg.HTTPTimeout}
 	base := strings.TrimRight(cfg.JiraBaseURL, "/")
 	startAt := 0
+	var versions []jiraVersion
 	for {
-		reqURL := fmt.Sprintf("%s/rest/agile/1.0/board/%d/sprint?state=active,future,closed&startAt=%d&maxResults=50", base, boardID, startAt)
+		reqURL := fmt.Sprintf("%s/rest/api/3/project/%s/versions?maxResults=50&orderBy=-sequence&startAt=%d", base, url.PathEscape(projectKeyOrID), startAt)
 		req, _ := http.NewRequestWithContext(ctx, http.MethodGet, reqURL, nil)
 		req.Header.Set("Authorization", jiraAuthHeader(cfg.JiraEmail, cfg.JiraAPIToken))
 		req.Header.Set("Accept", "application/json")
 		resp, err := client.Do(req)
 		if err != nil {
-			return 0, err
+			return nil, err
+		}
+		body, readErr := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+		resp.Body.Close()
+		if readErr != nil {
+			return nil, readErr
 		}
 		if resp.StatusCode != 200 {
-			b, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
-			resp.Body.Close()
-			if resp.StatusCode == 400 && boardHasNoSprints(b) {
-				return 0, errBoardWithoutSprints
+			return nil, fmt.Errorf("jira version list status %d: %s", resp.StatusCode, string(body))
+		}
+		var wrapper struct {
+			Values     []jiraVersion `json:"values"`
+			IsLast     bool          `json:"isLast,omitzero"`
+			MaxResults int           `json:"maxResults,omitzero"`
+		}
+		if err := json.Unmarshal(body, &wrapper); err == nil && (len(wrapper.Values) > 0 || wrapper.IsLast) {
+			versions = append(versions, wrapper.Values...)
+			if wrapper.IsLast || len(wrapper.Values) == 0 || len(wrapper.Values) < wrapper.MaxResults {
+				break
 			}
-			return 0, fmt.Errorf("jira sprint list status %d board %d: %s", resp.StatusCode, boardID, string(b))
+			startAt += len(wrapper.Values)
+			continue
 		}
-		var out jiraSprintListResponse
-		if decodeErr := json.UnmarshalRead(resp.Body, &out); decodeErr != nil {
-			resp.Body.Close()
-			return 0, decodeErr
-		}
-		resp.Body.Close()
-		for _, sprint := range out.Values {
-			if strings.EqualFold(strings.TrimSpace(sprint.Name), targetName) {
-				return sprint.ID, nil
-			}
-		}
-		if out.IsLast || len(out.Values) == 0 {
+		var direct []jiraVersion
+		if err := json.Unmarshal(body, &direct); err == nil {
+			versions = append(versions, direct...)
 			break
 		}
-		startAt += len(out.Values)
+		return nil, fmt.Errorf("unexpected Jira version payload: %s", string(body))
 	}
-	return 0, errSprintNotFound
+	return versions, nil
 }
 
-func boardHasNoSprints(body []byte) bool {
-	type jiraError struct {
-		ErrorMessages []string `json:"errorMessages"`
+func selectCurrentFixVersion(versions []jiraVersion) (jiraVersion, bool) {
+	var chosen jiraVersion
+	found := false
+	for _, v := range versions {
+		if v.Archived || v.Released {
+			continue
+		}
+		if !found {
+			chosen = v
+			found = true
+			continue
+		}
+		if compareVersions(v, chosen) > 0 {
+			chosen = v
+		}
 	}
-	var payload jiraError
-	if err := json.Unmarshal(body, &payload); err != nil {
+	if found {
+		return chosen, true
+	}
+	for _, v := range versions {
+		if v.Archived {
+			continue
+		}
+		if !found {
+			chosen = v
+			found = true
+			continue
+		}
+		if compareVersions(v, chosen) > 0 {
+			chosen = v
+		}
+	}
+	return chosen, found
+}
+
+func compareVersions(a, b jiraVersion) int {
+	if a.Sequence != 0 || b.Sequence != 0 {
+		if a.Sequence > b.Sequence {
+			return 1
+		}
+		if a.Sequence < b.Sequence {
+			return -1
+		}
+	}
+	if ta, oka := parseJiraDateTime(a.ReleaseDate); oka {
+		if tb, okb := parseJiraDateTime(b.ReleaseDate); okb {
+			if ta.After(tb) {
+				return 1
+			}
+			if ta.Before(tb) {
+				return -1
+			}
+		} else {
+			return 1
+		}
+	} else if _, okb := parseJiraDateTime(b.ReleaseDate); okb {
+		return -1
+	}
+	if ta, oka := parseJiraDateTime(a.StartDate); oka {
+		if tb, okb := parseJiraDateTime(b.StartDate); okb {
+			if ta.After(tb) {
+				return 1
+			}
+			if ta.Before(tb) {
+				return -1
+			}
+		} else {
+			return 1
+		}
+	} else if _, okb := parseJiraDateTime(b.StartDate); okb {
+		return -1
+	}
+	return strings.Compare(strings.TrimSpace(a.Name), strings.TrimSpace(b.Name))
+}
+
+func issueHasFixVersion(existing []jiraVersion, targetID string) bool {
+	targetID = strings.TrimSpace(targetID)
+	if targetID == "" {
 		return false
 	}
-	for _, msg := range payload.ErrorMessages {
-		if strings.Contains(strings.ToLower(msg), "does not support sprints") {
+	for _, version := range existing {
+		if strings.TrimSpace(version.ID) == targetID {
 			return true
 		}
 	}
 	return false
+}
+
+func fixVersionNames(versions []jiraVersion) []string {
+	names := make([]string, 0, len(versions))
+	for _, version := range versions {
+		if trimmed := strings.TrimSpace(version.Name); trimmed != "" {
+			names = append(names, trimmed)
+		}
+	}
+	return names
 }
 
 func jiraAddIssuesToSprint(ctx context.Context, cfg config, sprintID int, issueKeys []string) error {
@@ -1876,6 +2217,8 @@ func buildCreateFieldsMap(ctx context.Context, cfg config, repo string, is ghIss
 		"summary": summary,
 		"labels":  labels,
 	}
+	hasAssignee := hasGitHubAssignee(is)
+	alignWithTeamPlan := hasAssignee || !isGitHubOpen(is)
 	if components := determineJiraComponents(cfg.UserConfig, repo); len(components) > 0 {
 		fields["components"] = components
 	}
@@ -1901,6 +2244,16 @@ func buildCreateFieldsMap(ctx context.Context, cfg config, repo string, is ghIss
 		fields["assignee"] = nil
 	} else if assigneeAccountID != "" {
 		fields["assignee"] = map[string]any{"accountId": assigneeAccountID}
+	}
+
+	if alignWithTeamPlan {
+		if fixVersion, resolveErr := resolveCurrentFixVersion(ctx, cfg); resolveErr != nil {
+			if !errors.Is(resolveErr, errFixVersionNotFound) {
+				log.Printf("warn: failed to resolve fix version for %s/%s#%d: %v", cfg.UserConfig.GitHubOwner, repo, is.Number, resolveErr)
+			}
+		} else if strings.TrimSpace(fixVersion.ID) != "" {
+			fields["fixVersions"] = []map[string]any{{"id": fixVersion.ID}}
+		}
 	}
 
 	// Project/issuetype references
