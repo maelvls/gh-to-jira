@@ -100,22 +100,35 @@ gh-to-jira overwrites some fields in the Jira ticket when syncing from GitHub:
 | Sprint            | No, just pre-filled with "cert-manager - OpenSource" |
 | Fix Version       | No                                                   |
 | Components        | Yes                                                  |
-| Capacity Category | No, just pre-filled \*                               |
+| Capacity Category | No, just pre-filled (see below)                      |
 | Title             | No, just pre-filled                                  |
 | Summary           | No                                                   |
 
-\* The "Capacity Category" field in the Jira ticket is set depending on the
-GitHub issue or PR issue type:
+### Capacity Category
+
+The Capacity Category depends on GitHub issue or PR issue type, if the GitHub issue or PR has a type:
 
 | GitHub Issue Type | Capacity Category in Jira |
 |-------------------|---------------------------|
 | Bug               | Maintenance               |
 | Task              | Maintenance               |
 | Feature           | Feature                   |
+| (no type)         | Maintenance               |
 
-## How do I link an existing Jira ticket?
+### Assignee and Status
 
-Yes. All you have to do is add the following text to the Environment block:
+The Jira status depends on a few things:
+
+| GitHub assignee   | GitHub status | Jira assignee     | Jira status |
+|--|--|--|--|
+| none              | Open          | none              | New         |
+| CyberArk employee | Open          | CyberArk employee | **In Progress** (since the bot guesses that if an assignee has been set, it means CyberArk employee is working on it) |
+| none              | Closed        | none              | Closed      |
+
+## Linking an existing Jira ticket
+
+If you have an existing Jira ticket and you want to link it to a GitHub issue or PR,
+add the following text to the Environment block:
 
 ```
 cert-manager/trust-manager#1234
