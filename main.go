@@ -1254,21 +1254,6 @@ func jiraUpdateFromGitHubIssue(ctx context.Context, cfg config, issueKey string,
 		}
 	}
 
-	var fixVersionForUpdate *jiraVersion
-	if alignWithTeamPlan {
-		if fixVersion, resolveErr := resolveCurrentFixVersion(ctx, cfg); resolveErr != nil {
-			if !errors.Is(resolveErr, errFixVersionNotFound) {
-				log.Printf("warn: failed to resolve fix version for %s: %v", repoRef, resolveErr)
-			}
-		} else if strings.TrimSpace(fixVersion.ID) != "" {
-			if len(snapshot.FixVersions) != 1 || !issueHasFixVersion(snapshot.FixVersions, fixVersion.ID) {
-				copyFixVersion := fixVersion
-				fixVersionForUpdate = &copyFixVersion
-				fieldPayload["fixVersions"] = []map[string]any{{"id": fixVersion.ID}}
-			}
-		}
-	}
-
 	type fieldChange struct {
 		Field  string
 		Reason string
@@ -1317,15 +1302,6 @@ func jiraUpdateFromGitHubIssue(ctx context.Context, cfg config, issueKey string,
 				New:    formatLogValue(teamOptionID),
 			})
 		}
-	}
-
-	if fixVersionForUpdate != nil {
-		changes = append(changes, fieldChange{
-			Field:  "fixVersions",
-			Reason: fmt.Sprintf("Aligning fix version with current program increment for %s.", repoRef),
-			Old:    formatLogValue(sortedStrings(fixVersionNames(snapshot.FixVersions))),
-			New:    formatLogValue([]string{strings.TrimSpace(fixVersionForUpdate.Name)}),
-		})
 	}
 
 	if assignDecisionMade {
