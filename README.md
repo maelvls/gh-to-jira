@@ -134,7 +134,8 @@ add the following text to the Environment block:
 cert-manager/trust-manager#1234
 ```
 
-Wait for a bit and gh-to-jira will link the existing Jira ticket to that GitHub issue or PR.
+Then, add the `cybr` label to the GitHub issue or PR. Wait for a bit and
+gh-to-jira will link the existing Jira ticket to that GitHub issue or PR.
 
 ## Can I change the Jira task to an epic?
 
