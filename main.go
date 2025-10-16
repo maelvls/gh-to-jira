@@ -2290,6 +2290,8 @@ func determineJiraComponents(userCfg UserConfig, repo string) []map[string]any {
 	return []map[string]any{{"name": componentName}}
 }
 
+const defaultCapacityCategory = "Maintenance"
+
 var capacityCategoryByIssueTypeID = map[int]string{
 	7830850: "Maintenance", // Task
 	7830853: "Maintenance", // Bug
@@ -2303,8 +2305,9 @@ var capacityCategoryByIssueTypeName = map[string]string{
 }
 
 func determineCapacityCategory(is ghIssue) string {
+	// Default to Maintenance so freshly created tickets always get a value.
 	if is.IssueType == (ghIssueType{}) {
-		return ""
+		return defaultCapacityCategory
 	}
 	if val, ok := capacityCategoryByIssueTypeID[is.IssueType.ID]; ok {
 		return val
@@ -2314,7 +2317,7 @@ func determineCapacityCategory(is ghIssue) string {
 			return val
 		}
 	}
-	return ""
+	return defaultCapacityCategory
 }
 
 // fetchCreateMetaRequiredFields fetches required fields for the configured project and issuetype.
