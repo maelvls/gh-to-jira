@@ -88,7 +88,7 @@ cyberark_known_users:
 - Scans repos for issues/PRs with the configured label
 - Creates Jira tickets: `<repo>#<n>: <title>`
 - Uses environment field for duplicate detection (`<owner>/<repo>#<n>`)
-- Auto-assigns from GitHub assignees unless the reporter is a CyberArk user.
+- Auto-assigns from GitHub assignees.
 - Syncs status: open without assignee → non-closed, assigned items → promoted to In Progress when Jira is New/Closed, closed/merged → closed, draft → In Progress.
 - Updates labels/assignee each sync; leaves summary/description editable
 
