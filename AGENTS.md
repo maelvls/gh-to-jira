@@ -10,3 +10,5 @@ source .envrc && curl -sS -u "$JIRA_EMAIL:$JIRA_API_TOKEN" \
 If you need to inspect a GitHub issue or PR, use:
 
 gh api /repos/cert-manager/cert-manager/issues/8171
+
+Don't forget to update README.md if necessary if you change something user-facing like some change of behavior in the bot.
