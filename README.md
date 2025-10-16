@@ -113,8 +113,22 @@ GitHub issue or PR issue type:
 | Task              | Maintenance               |
 | Feature           | Feature                   |
 
+## How do I link an existing Jira ticket?
+
+Yes. All you have to do is add the following text to the Environment block:
+
+```
+cert-manager/trust-manager#1234
+```
+
+Wait for a bit and gh-to-jira will link the existing Jira ticket to that GitHub issue or PR.
+
+## Can I change the Jira task to an epic?
+
+Yes, and gh-to-jira will keep tracking it (the Environment field is carried over, just hidden).
+
 ## Notes
 
-- Don't edit the environment field marker `(do not edit this)` - used for duplicate detection
-- Status transitions require proper Jira workflow configuration
-- Bot auto-fills required Jira fields using CreateMeta
+- Don't edit the environment field marker `(do not edit this)` - used for duplicate detection.
+- Status transitions require proper Jira workflow configuration.
+- Bot auto-fills required Jira fields using CreateMeta.
