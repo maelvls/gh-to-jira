@@ -104,13 +104,13 @@ gh-to-jira overwrites some fields in the Jira ticket when syncing from GitHub:
 | Sprint            | No, just pre-filled with "cert-manager - OpenSource" |
 | Fix Version       | No                                                   |
 | Components        | Yes                                                  |
-| Capacity Category | No, just pre-filled (see below)                      |
+| Capacity Category | No, set once at creation \*                          |
 | Title             | No, just pre-filled                                  |
 | Summary           | No                                                   |
 
-### Capacity Category
-
-The Capacity Category depends on GitHub issue or PR issue type, if the GitHub issue or PR has a type:
+\* The "Capacity Category" field in the Jira ticket is set depending on the
+GitHub issue or PR issue type. When GitHub omits an issue type, the field
+defaults to `Maintenance` during ticket creation.
 
 | GitHub Issue Type | Capacity Category in Jira |
 | ----------------- | ------------------------- |
