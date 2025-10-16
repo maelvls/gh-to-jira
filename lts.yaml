@@ -1,0 +1,38 @@
+schemaVersion: 2
+mediaType: application/vnd.oci.image.index.v1+json
+annotations:
+  org.opencontainers.image.base.digest: sha256:...
+  org.opencontainers.image.base.name: gcr.io/distroless/static-debian12:nonroot-af7e4bb0ab28cc83de4d43b694c78651dd1dca10
+  org.opencontainers.image.created: "2025-10-14T16:04:58Z"
+  org.opencontainers.image.revision: 5d23578434819d3823da2aaf45c4b11941239af8
+  org.opencontainers.image.source: https://gitlab.com/venafi/vaas/applications/tls-protect-for-k8s/cert-manager-enterprise
+  org.opencontainers.image.vendor: CyberArk Software Ltd.
+  org.opencontainers.image.version: v1.17.5
+manifests:
+  - mediaType: application/vnd.oci.image.manifest.v1+json
+    digest: sha256:...
+    platform:
+      architecture: amd64
+      os: linux
+  - mediaType: application/vnd.oci.image.manifest.v1+json
+    digest: sha256:...
+    platform:
+      architecture: arm64
+      os: linux
+      variant: v8
+  - mediaType: application/vnd.oci.image.manifest.v1+json
+    digest: sha256:...
+    platform:
+      architecture: arm
+      os: linux
+      variant: v7
+  - mediaType: application/vnd.oci.image.manifest.v1+json
+    digest: sha256:...
+    platform:
+      architecture: ppc64le
+      os: linux
+  - mediaType: application/vnd.oci.image.manifest.v1+json
+    digest: sha256:...
+    platform:
+      architecture: s390x
+      os: linux

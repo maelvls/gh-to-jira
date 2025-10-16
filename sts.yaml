@@ -1,0 +1,41 @@
+schemaVersion: 2
+mediaType: application/vnd.docker.distribution.manifest.list.v2+json
+annotations:
+  com.cyberark.image.fips: "false"
+  org.opencontainers.image.authors: support@venafi.cloud
+  org.opencontainers.image.description: Automatically provision and manage TLS certificates in Kubernetes and OpenShift
+  org.opencontainers.image.documentation: https://docs.venafi.cloud/vaas/k8s-components/c-certmanager-overview/
+  org.opencontainers.image.licenses: EULA - https://www.cyberark.com/contract-terms/
+  org.opencontainers.image.revision: v1.17.4-0000000
+  org.opencontainers.image.title: cert-manager Core
+  org.opencontainers.image.url: https://www.cyberark.com/products/certificate-manager-for-kubernetes/
+  org.opencontainers.image.vendor: CyberArk Software Ltd.
+  org.opencontainers.image.version: v1.17.4
+manifests:
+  - mediaType: application/vnd.docker.distribution.manifest.v2+json
+    digest: sha256:...
+    platform:
+      architecture: amd64
+      os: linux
+  - mediaType: application/vnd.docker.distribution.manifest.v2+json
+    digest: sha256:...
+    platform:
+      architecture: arm64
+      os: linux
+      variant: v8
+  - mediaType: application/vnd.docker.distribution.manifest.v2+json
+    digest: sha256:...
+    platform:
+      architecture: arm
+      os: linux
+      variant: v7
+  - mediaType: application/vnd.docker.distribution.manifest.v2+json
+    digest: sha256:...
+    platform:
+      architecture: ppc64le
+      os: linux
+  - mediaType: application/vnd.docker.distribution.manifest.v2+json
+    digest: sha256:...
+    platform:
+      architecture: s390x
+      os: linux
