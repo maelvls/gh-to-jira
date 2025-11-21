@@ -5,6 +5,7 @@ Syncs labeled GitHub issues/PRs to Jira tickets. Polls every minute, creates or 
 ## Quick Start
 
 **Required environment variables:**
+
 ```bash
 export GITHUB_TOKEN="ghp_..."
 export JIRA_BASE_URL="https://your-domain.atlassian.net"
@@ -13,6 +14,7 @@ export JIRA_API_TOKEN="..."
 ```
 
 **Minimal `config.yaml`:**
+
 ```yaml
 jira_project_key: "PROJ"
 github_owner: "cert-manager"
@@ -26,6 +28,7 @@ cyberark_known_users:
 ```
 
 **Run:**
+
 ```bash
 go run .              # Live mode
 go run . --dry-run    # Preview mode
@@ -41,13 +44,13 @@ All non-secret config goes in `config.yaml`. Defaults work for most settings.
 ```yaml
 # GitHub Configuration
 github_owner: "cert-manager"
-github_repos: []              # Empty = scan all repos in org
+github_repos: [] # Empty = scan all repos in org
 github_label: "cybr"
 
 # Jira Configuration
-jira_project_key: "PROJ"      # Required
+jira_project_key: "PROJ" # Required
 jira_issue_type: "Task"
-jira_skip_description: true   # Set false to add GitHub link in description
+jira_skip_description: true # Set false to add GitHub link in description
 
 # Jira Team Field (optional)
 jira_team_field_key: "customfield_10211"
@@ -75,6 +78,7 @@ github_to_jira_users:
 cyberark_known_users:
   - john.doe
 ```
+
 </details>
 
 **Find Jira account IDs:** People → View all people → Click user → Copy ID from URL.
@@ -94,8 +98,8 @@ cyberark_known_users:
 
 gh-to-jira overwrites some fields in the Jira ticket when syncing from GitHub:
 
-|    Field Name     |              Overwritten by gh-to-jira               |
-|-------------------|------------------------------------------------------|
+| Field Name        | Overwritten by gh-to-jira                            |
+| ----------------- | ---------------------------------------------------- |
 | Assignee          | Yes (set to the GitHub issue or PR assignee)         |
 | Sprint            | No, just pre-filled with "cert-manager - OpenSource" |
 | Fix Version       | No                                                   |
@@ -109,7 +113,7 @@ gh-to-jira overwrites some fields in the Jira ticket when syncing from GitHub:
 The Capacity Category depends on GitHub issue or PR issue type, if the GitHub issue or PR has a type:
 
 | GitHub Issue Type | Capacity Category in Jira |
-|-------------------|---------------------------|
+| ----------------- | ------------------------- |
 | Bug               | Maintenance               |
 | Task              | Maintenance               |
 | Feature           | Feature                   |
@@ -119,40 +123,43 @@ The Capacity Category depends on GitHub issue or PR issue type, if the GitHub is
 
 The Jira status depends on a few things:
 
-| GitHub assignee   | GitHub status | Jira assignee     | Jira status |
-|--|--|--|--|
-| none              | Open          | none              | New         |
+| GitHub assignee   | GitHub status | Jira assignee     | Jira status                                                                                                           |
+| ----------------- | ------------- | ----------------- | --------------------------------------------------------------------------------------------------------------------- |
+| none              | Open          | none              | New                                                                                                                   |
 | CyberArk employee | Open          | CyberArk employee | **In Progress** (since the bot guesses that if an assignee has been set, it means CyberArk employee is working on it) |
-| none              | Closed        | none              | Closed      |
+| none              | Closed        | none              | Closed                                                                                                                |
 
 ## Linking an existing Jira ticket
 
-If you have an existing Jira ticket and you want to link it to a GitHub issue or PR,
-add the following text to the Environment block:
+If you have an existing Jira ticket and you want to link it to a GitHub issue or
+PR, add the following text to the Environment block:
 
-```
+```text
 cert-manager/trust-manager#1234
 ```
 
 Then, add the `cybr` label to the GitHub issue or PR. Wait for a bit and
 gh-to-jira will link the existing Jira ticket to that GitHub issue or PR.
 
-### Best Practice: Use a Parent GitHub Issue
+### Best Practice: Use a Parent GitHub Issue, Not Directly Linking PRs
 
-In most cases, it's preferable to create a "parent" GitHub issue instead of directly linking a GitHub PR to Jira. From the parent GitHub issue, you can link to the various PRs. This approach provides better organization and tracking.
+In most cases, it's preferable to create a "parent" GitHub issue instead of
+directly linking a GitHub PR to Jira. From the parent GitHub issue, you can link
+to the various PRs. This approach provides better organization and tracking.
 
-For example, see how this was done for [cert-manager/cert-manager#8251](https://github.com/cert-manager/cert-manager/issues/8251), where the issue serves as a central point linking to related PRs.
+For example, see how this was done for
+[cert-manager/cert-manager#8251](https://github.com/cert-manager/cert-manager/issues/8251),
+where the issue serves as a central point linking to related PRs.
 
 ### Important: Un-linking is Not Possible
 
-It's not possible to un-link a Jira ticket from a GitHub issue or PR once linked. This is because Jira's search has some form of cache. Even after removing the reference string (e.g., "Ref: cert-manager/cert-manager#1234") from the Environment block, searching for that string in Jira will still work and the link will persist.
+It's not possible to un-link a Jira ticket from a GitHub issue or PR once
+linked. This is because Jira's search has some form of cache. Even after
+removing the reference string (e.g., "Ref: cert-manager/cert-manager#1234") from
+the Environment block, searching for that string in Jira will still work and the
+link will persist.
 
 ## Can I change the Jira task to an epic?
 
-Yes, and gh-to-jira will keep tracking it (the Environment field is carried over, just hidden).
-
-## Notes
-
-- Don't edit the environment field marker `(do not edit this)` - used for duplicate detection.
-- Status transitions require proper Jira workflow configuration.
-- Bot auto-fills required Jira fields using CreateMeta.
+Yes, and gh-to-jira will keep tracking it (the "Environment" field is carried
+over, just hidden).
