@@ -137,6 +137,16 @@ cert-manager/trust-manager#1234
 Then, add the `cybr` label to the GitHub issue or PR. Wait for a bit and
 gh-to-jira will link the existing Jira ticket to that GitHub issue or PR.
 
+### Best Practice: Use a Parent GitHub Issue
+
+In most cases, it's preferable to create a "parent" GitHub issue instead of directly linking a GitHub PR to Jira. From the parent GitHub issue, you can link to the various PRs. This approach provides better organization and tracking.
+
+For example, see how this was done for [cert-manager/cert-manager#8251](https://github.com/cert-manager/cert-manager/issues/8251), where the issue serves as a central point linking to related PRs.
+
+### Important: Un-linking is Not Possible
+
+It's not possible to un-link a Jira ticket from a GitHub issue or PR once linked. This is because Jira's search has some form of cache. Even after removing the reference string (e.g., "Ref: cert-manager/cert-manager#1234") from the Environment block, searching for that string in Jira will still work and the link will persist.
+
 ## Can I change the Jira task to an epic?
 
 Yes, and gh-to-jira will keep tracking it (the Environment field is carried over, just hidden).
