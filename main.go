@@ -948,10 +948,15 @@ func isNewStatus(status string, cfg config) bool {
 }
 
 // determineJiraAssignee determines the best Jira assignee based on GitHub issue/PR data.
-// Returns a Jira account ID, a flag indicating whether Jira should be explicitly unassigned, and an error.
+// Returns (jiraAccountID, clearAssignee, error) where:
+//   - jiraAccountID is the Jira account ID to assign (empty if no mapping found)
+//   - clearAssignee=true means explicitly unassign in Jira
+//   - clearAssignee=false with empty jiraAccountID means no change to Jira assignee
+//
+// When GitHub has no assignee, returns ("", false, nil) to indicate no change should be made.
 func determineJiraAssignee(_ context.Context, cfg config, _ string, is ghIssue) (string, bool, error) {
 	if !hasGitHubAssignee(is) {
-		return "", true, nil
+		return "", false, nil
 	}
 
 	seen := make(map[string]struct{})

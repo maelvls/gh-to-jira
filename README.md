@@ -88,7 +88,7 @@ cyberark_known_users:
 - Scans repos for issues/PRs with the configured label
 - Creates Jira tickets: `<repo>#<n>: <title>`
 - Uses environment field for duplicate detection (`<owner>/<repo>#<n>`)
-- Auto-assigns from GitHub assignees.
+- Auto-assigns from GitHub assignees (only updates when GitHub has an assignee).
 - Syncs status: open without assignee → non-closed, assigned items → promoted to In Progress when Jira is New/Closed, closed/merged → closed, draft → In Progress.
 - Updates labels/assignee each sync; leaves summary/description editable
 
@@ -98,15 +98,15 @@ cyberark_known_users:
 
 gh-to-jira overwrites some fields in the Jira ticket when syncing from GitHub:
 
-| Field Name        | Overwritten by gh-to-jira                            |
-| ----------------- | ---------------------------------------------------- |
-| Assignee          | Yes (set to the GitHub issue or PR assignee)         |
-| Sprint            | No, just pre-filled with "cert-manager - OpenSource" |
-| Fix Version       | No                                                   |
-| Components        | Yes                                                  |
-| Capacity Category | No, set once at creation \*                          |
-| Title             | No, just pre-filled                                  |
-| Summary           | No                                                   |
+| Field Name        | Overwritten by gh-to-jira                                                     |
+| ----------------- | ----------------------------------------------------------------------------- |
+| Assignee          | Only when GitHub has an assignee (does not clear if GitHub has none)          |
+| Sprint            | No, just pre-filled with "cert-manager - OpenSource"                          |
+| Fix Version       | No                                                                            |
+| Components        | Yes                                                                           |
+| Capacity Category | No, set once at creation \*                                                   |
+| Title             | No, just pre-filled                                                           |
+| Summary           | No                                                                            |
 
 \* The "Capacity Category" field in the Jira ticket is set depending on the
 GitHub issue or PR issue type. When GitHub omits an issue type, the field
@@ -121,13 +121,18 @@ defaults to `Maintenance` during ticket creation.
 
 ### Assignee and Status
 
+The bot syncs assignee from GitHub to Jira when a GitHub issue/PR has an assignee.
+**Important:** If no one is assigned on GitHub, the bot will NOT change the Jira
+assignee. This allows you to manually assign someone in Jira without the bot
+clearing it on the next sync.
+
 The Jira status depends on a few things:
 
-| GitHub assignee   | GitHub status | Jira assignee     | Jira status                                                                                                           |
-| ----------------- | ------------- | ----------------- | --------------------------------------------------------------------------------------------------------------------- |
-| none              | Open          | none              | New                                                                                                                   |
-| CyberArk employee | Open          | CyberArk employee | **In Progress** (since the bot guesses that if an assignee has been set, it means CyberArk employee is working on it) |
-| none              | Closed        | none              | Closed                                                                                                                |
+| GitHub assignee   | GitHub status | Jira assignee                        | Jira status                                                                                                           |
+| ----------------- | ------------- | ------------------------------------ | --------------------------------------------------------------------------------------------------------------------- |
+| none              | Open          | unchanged (manual assignment kept)   | New                                                                                                                   |
+| CyberArk employee | Open          | CyberArk employee                    | **In Progress** (since the bot guesses that if an assignee has been set, it means CyberArk employee is working on it) |
+| none              | Closed        | unchanged (manual assignment kept)   | Closed                                                                                                                |
 
 ## Linking an existing Jira ticket
 
